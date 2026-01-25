@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Data and checkpoints
+data/
+checkpoints/
+.checkpoints/
+results/
+
+# Wandb
+wandb/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/
+
+# Working notes
+plan_*.txt
+progress_report.md
+
+# OS
+.DS_Store
+Thumbs.db
