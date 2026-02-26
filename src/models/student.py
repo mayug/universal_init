@@ -56,12 +56,14 @@ class StudentModel(nn.Module):
         num_classes: int = None,  # If set, adds classifier head instead of projector
         keep_projector: bool = False,  # If True, keep projector in downstream mode
         train_projector: bool = False,  # If True, projector is trainable (not frozen)
+        teacher_dim: int = 1024,  # Teacher embedding dimension
     ):
         super().__init__()
         self.init_mode = init_mode
         self.projector_type = projector_type
         self.keep_projector = keep_projector
         self.train_projector = train_projector
+        self.teacher_dim = teacher_dim
 
         # Load backbone
         if init_mode == "imagenet":
@@ -80,11 +82,11 @@ class StudentModel(nn.Module):
                 use_mlp = projector_type == "mlp"
                 self.projector = ProjectorHead(
                     in_dim=self.BACKBONE_DIM,
-                    out_dim=self.TEACHER_DIM,
+                    out_dim=self.teacher_dim,
                     hidden_dim=projector_hidden_dim if use_mlp else None,
                     use_mlp=use_mlp
                 )
-                self.head = nn.Linear(self.TEACHER_DIM, num_classes)
+                self.head = nn.Linear(self.teacher_dim, num_classes)
                 # Mode depends on whether projector is trainable
                 if train_projector:
                     self.mode = "classifier_with_trainable_projector"
@@ -101,7 +103,7 @@ class StudentModel(nn.Module):
             self.projector = None
             self.head = ProjectorHead(
                 in_dim=self.BACKBONE_DIM,
-                out_dim=self.TEACHER_DIM,
+                out_dim=self.teacher_dim,
                 hidden_dim=projector_hidden_dim if use_mlp else None,
                 use_mlp=use_mlp
             )
@@ -218,14 +220,16 @@ class StudentModel(nn.Module):
     def for_distillation(
         cls,
         projector_type: str = "linear",
-        projector_hidden_dim: int = 512
+        projector_hidden_dim: int = 512,
+        teacher_dim: int = 1024,
     ) -> "StudentModel":
         """Create student model configured for distillation."""
         return cls(
             init_mode="random",
             projector_type=projector_type,
             projector_hidden_dim=projector_hidden_dim,
-            num_classes=None
+            num_classes=None,
+            teacher_dim=teacher_dim,
         )
 
     @classmethod
@@ -235,7 +239,8 @@ class StudentModel(nn.Module):
         init_mode: str = "random",
         checkpoint_path: str = None,
         keep_projector: bool = False,
-        train_projector: bool = False
+        train_projector: bool = False,
+        teacher_dim: int = 1024,
     ) -> "StudentModel":
         """
         Create student model configured for downstream classification.
@@ -246,11 +251,13 @@ class StudentModel(nn.Module):
             checkpoint_path: Path to distillation checkpoint (for distilled mode)
             keep_projector: If True, keep projector from distillation
             train_projector: If True, projector is trainable (requires keep_projector=True)
+            teacher_dim: Teacher embedding dimension (must match checkpoint)
         """
         return cls(
             init_mode=init_mode,
             checkpoint_path=checkpoint_path,
             num_classes=num_classes,
             keep_projector=keep_projector,
-            train_projector=train_projector
+            train_projector=train_projector,
+            teacher_dim=teacher_dim,
         )

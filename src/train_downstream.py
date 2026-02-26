@@ -44,6 +44,10 @@ def parse_args():
                         help="Keep projector from distillation (only with init=distilled)")
     parser.add_argument("--train_projector", action="store_true",
                         help="Make projector trainable (requires --keep_projector)")
+    parser.add_argument("--teacher_dim", type=int, default=None,
+                        help="Teacher embedding dim (auto-detected from checkpoint if not set)")
+    parser.add_argument("--teacher_name", type=str, default=None,
+                        help="Teacher name for result filenames (auto-detected from checkpoint)")
 
     # Training
     parser.add_argument("--epochs", type=int, default=50,
@@ -225,6 +229,24 @@ def main():
     num_classes = get_num_classes(args.dataset)
     print(f"\nNumber of classes: {num_classes}")
 
+    # Auto-detect teacher_dim and teacher_name from checkpoint
+    teacher_dim = args.teacher_dim or 1024  # default for legacy ImageBind
+    teacher_name = args.teacher_name
+    if args.init == "distilled" and args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        ckpt_args = ckpt.get("args", {})
+        if args.teacher_dim is None and "student_state_dict" in ckpt:
+            # Detect from projector weight shape
+            student_state = ckpt["student_state_dict"]
+            if "head.projector.weight" in student_state:
+                teacher_dim = student_state["head.projector.weight"].shape[0]
+            elif "head.weight" in student_state:
+                teacher_dim = student_state["head.weight"].shape[0]
+        if teacher_name is None:
+            teacher_name = ckpt_args.get("teacher", "imagebind")
+        del ckpt  # free memory
+        print(f"Auto-detected teacher_dim={teacher_dim}, teacher_name={teacher_name}")
+
     # Create model
     print(f"\nCreating model with {args.init} initialization...")
     if args.keep_projector:
@@ -238,6 +260,7 @@ def main():
         checkpoint_path=args.checkpoint,
         keep_projector=args.keep_projector,
         train_projector=args.train_projector,
+        teacher_dim=teacher_dim,
     ).to(args.device)
 
     # Count parameters
@@ -347,9 +370,12 @@ def main():
         suffix = "_trainproj" if args.train_projector else "_keepproj"
     else:
         suffix = ""
+    init_label = args.init
+    if args.init == "distilled" and teacher_name and teacher_name != "imagebind":
+        init_label = f"distilled_{teacher_name}"
     results_path = os.path.join(
         args.output_dir,
-        f"results_{args.dataset}_{args.init}{suffix}_frac{args.label_fraction}_s{args.seed}.csv"
+        f"results_{args.dataset}_{init_label}{suffix}_frac{args.label_fraction}_s{args.seed}.csv"
     )
     import pandas as pd
     results_df = pd.DataFrame([{

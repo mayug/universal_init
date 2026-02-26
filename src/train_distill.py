@@ -31,8 +31,21 @@ from src.losses.validation_metrics import (
 )
 
 
+TEACHER_CONFIGS = {
+    "imagebind":   {"class": "ImageBindTeacher"},
+    "supervised":  {"model": "vit_base_patch16_224.augreg_in1k",   "use_head": False},  # 768-dim
+    "clip_768":    {"model": "vit_base_patch16_clip_224.openai",    "use_head": False},  # 768-dim
+    "clip_512":    {"model": "vit_base_patch16_clip_224.openai",    "use_head": True},   # 512-dim
+}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Distillation training")
+
+    # Teacher
+    parser.add_argument("--teacher", type=str, default="imagebind",
+                        choices=list(TEACHER_CONFIGS.keys()),
+                        help="Teacher model for distillation")
 
     # Data
     parser.add_argument("--dataset", type=str, default="imagenette",
@@ -247,17 +260,18 @@ def main():
 
     # Initialize W&B
     if not args.no_wandb:
-        run_name = args.wandb_run_name or f"distill_{args.dataset}_{args.loss}_s{args.seed}"
+        run_name = args.wandb_run_name or f"distill_{args.teacher}_{args.dataset}_{args.loss}_s{args.seed}"
         wandb.init(
             project=args.wandb_project,
             name=run_name,
             config=vars(args),
-            tags=["distillation", args.dataset, args.loss],
+            tags=["distillation", args.dataset, args.loss, args.teacher],
         )
 
     print("=" * 60)
     print("Distillation Training")
     print("=" * 60)
+    print(f"Teacher: {args.teacher}")
     print(f"Dataset: {args.dataset}")
     print(f"Loss: {args.loss}")
     print(f"Projector: {args.projector}")
@@ -269,8 +283,18 @@ def main():
     print("=" * 60)
 
     # Load teacher
-    print("\nLoading ImageBind teacher...")
-    teacher = ImageBindTeacher(device=args.device).load()
+    config = TEACHER_CONFIGS[args.teacher]
+    if args.teacher == "imagebind":
+        print("\nLoading ImageBind teacher...")
+        teacher = ImageBindTeacher(device=args.device).load()
+    else:
+        print(f"\nLoading {args.teacher} teacher ({config['model']})...")
+        from src.models.generic_teacher import GenericTeacher
+        teacher = GenericTeacher(
+            model_name=config["model"],
+            device=args.device,
+            use_head=config.get("use_head", False),
+        )
     print(f"Teacher loaded. Embedding dim: {teacher.embed_dim}")
 
     # Create student
@@ -278,6 +302,7 @@ def main():
     student = StudentModel.for_distillation(
         projector_type=args.projector,
         projector_hidden_dim=args.projector_hidden_dim,
+        teacher_dim=teacher.embed_dim,
     ).to(args.device)
     print(f"Student backbone dim: {student.BACKBONE_DIM}")
     print(f"Student projector: {args.projector}")
@@ -288,6 +313,12 @@ def main():
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
+    # Get teacher-specific transform config
+    transform_kwargs = {}
+    if args.teacher != "imagebind":
+        data_config = teacher.get_transform_config()
+        transform_kwargs = {"mean": list(data_config["mean"]), "std": list(data_config["std"])}
+
     # Load data with train/val split
     print(f"\nLoading {args.dataset} dataset with validation split...")
     train_loader, val_loader = get_distill_dataloaders_with_val(
@@ -297,6 +328,7 @@ def main():
         num_workers=args.num_workers,
         val_fraction=args.val_fraction,
         seed=args.seed,
+        **transform_kwargs,
     )
     print(f"Train size: {len(train_loader.dataset)}")
     print(f"Val size: {len(val_loader.dataset)}")
@@ -399,7 +431,7 @@ def main():
             best_val_cos_sim = val_cos_sim
             save_checkpoint(
                 student, optimizer, scheduler, epoch, args,
-                f"{args.dataset}_distilled_best.pth"
+                f"{args.dataset}_{args.teacher}_distilled_best.pth"
             )
 
         # Track best training cosine sim
@@ -410,13 +442,13 @@ def main():
         if epoch % args.save_every == 0:
             save_checkpoint(
                 student, optimizer, scheduler, epoch, args,
-                f"{args.dataset}_distilled_epoch{epoch}.pth"
+                f"{args.dataset}_{args.teacher}_distilled_epoch{epoch}.pth"
             )
 
     # Save final checkpoint
     save_checkpoint(
         student, optimizer, scheduler, args.epochs, args,
-        f"{args.dataset}_distilled_final.pth"
+        f"{args.dataset}_{args.teacher}_distilled_final.pth"
     )
 
     print("\n" + "=" * 60)

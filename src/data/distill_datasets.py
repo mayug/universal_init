@@ -11,29 +11,27 @@ from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
 
-def get_train_transform():
+def get_train_transform(mean=None, std=None):
     """Standard training augmentation for distillation."""
+    mean = mean or [0.485, 0.456, 0.406]
+    std = std or [0.229, 0.224, 0.225]
     return transforms.Compose([
         transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        ),
+        transforms.Normalize(mean=mean, std=std),
     ])
 
 
-def get_val_transform():
+def get_val_transform(mean=None, std=None):
     """Validation transform (no augmentation)."""
+    mean = mean or [0.485, 0.456, 0.406]
+    std = std or [0.229, 0.224, 0.225]
     return transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        ),
+        transforms.Normalize(mean=mean, std=std),
     ])
 
 
@@ -149,6 +147,8 @@ def get_distill_dataloader(
     batch_size: int = 256,
     num_workers: int = 8,
     split: str = "train",
+    mean=None,
+    std=None,
 ) -> DataLoader:
     """
     Get data loader for distillation pretraining.
@@ -159,11 +159,13 @@ def get_distill_dataloader(
         batch_size: Batch size
         num_workers: Number of data loading workers
         split: Data split to use
+        mean: Optional normalization mean (defaults to ImageNet)
+        std: Optional normalization std (defaults to ImageNet)
 
     Returns:
         DataLoader for the specified dataset
     """
-    transform = get_train_transform()
+    transform = get_train_transform(mean=mean, std=std)
 
     if dataset_name == "imagenette":
         dataset = ImagenetteDataset(
@@ -206,6 +208,8 @@ def get_distill_dataloaders_with_val(
     num_workers: int = 8,
     val_fraction: float = 0.1,
     seed: int = 42,
+    mean=None,
+    std=None,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Get train and validation data loaders for distillation with holdout split.
@@ -219,12 +223,14 @@ def get_distill_dataloaders_with_val(
         num_workers: Number of data loading workers
         val_fraction: Fraction of data to use for validation
         seed: Random seed for reproducible splits
+        mean: Optional normalization mean (defaults to ImageNet)
+        std: Optional normalization std (defaults to ImageNet)
 
     Returns:
         Tuple of (train_loader, val_loader)
     """
-    train_transform = get_train_transform()
-    val_transform = get_val_transform()
+    train_transform = get_train_transform(mean=mean, std=std)
+    val_transform = get_val_transform(mean=mean, std=std)
 
     if dataset_name == "imagenette":
         # For Imagenette, use built-in train/val split
