@@ -54,10 +54,14 @@ class StudentModel(nn.Module):
         projector_type: str = "linear",  # 'linear' or 'mlp'
         projector_hidden_dim: int = 512,
         num_classes: int = None,  # If set, adds classifier head instead of projector
+        keep_projector: bool = False,  # If True, keep projector in downstream mode
+        train_projector: bool = False,  # If True, projector is trainable (not frozen)
     ):
         super().__init__()
         self.init_mode = init_mode
         self.projector_type = projector_type
+        self.keep_projector = keep_projector
+        self.train_projector = train_projector
 
         # Load backbone
         if init_mode == "imagenet":
@@ -71,11 +75,30 @@ class StudentModel(nn.Module):
         # Add projector or classifier
         if num_classes is not None:
             # Downstream mode: classifier head
-            self.head = nn.Linear(self.BACKBONE_DIM, num_classes)
-            self.mode = "classifier"
+            if keep_projector and init_mode == "distilled":
+                # Keep projector from distillation + classifier on top
+                use_mlp = projector_type == "mlp"
+                self.projector = ProjectorHead(
+                    in_dim=self.BACKBONE_DIM,
+                    out_dim=self.TEACHER_DIM,
+                    hidden_dim=projector_hidden_dim if use_mlp else None,
+                    use_mlp=use_mlp
+                )
+                self.head = nn.Linear(self.TEACHER_DIM, num_classes)
+                # Mode depends on whether projector is trainable
+                if train_projector:
+                    self.mode = "classifier_with_trainable_projector"
+                else:
+                    self.mode = "classifier_with_projector"  # Frozen projector
+            else:
+                # Drop projector (default): classifier directly on backbone
+                self.projector = None
+                self.head = nn.Linear(self.BACKBONE_DIM, num_classes)
+                self.mode = "classifier"
         else:
             # Distillation mode: projector head
             use_mlp = projector_type == "mlp"
+            self.projector = None
             self.head = ProjectorHead(
                 in_dim=self.BACKBONE_DIM,
                 out_dim=self.TEACHER_DIM,
@@ -86,30 +109,71 @@ class StudentModel(nn.Module):
 
         # Load distilled weights if specified
         if init_mode == "distilled" and checkpoint_path is not None:
-            self.load_distilled_weights(checkpoint_path)
+            self.load_distilled_weights(
+                checkpoint_path,
+                load_projector=keep_projector,
+                freeze_projector=not train_projector
+            )
 
-    def load_distilled_weights(self, checkpoint_path: str):
-        """Load backbone weights from distillation checkpoint."""
+    def load_distilled_weights(self, checkpoint_path: str, load_projector: bool = False, freeze_projector: bool = True):
+        """
+        Load backbone weights from distillation checkpoint.
+
+        Args:
+            checkpoint_path: Path to distillation checkpoint
+            load_projector: If True, also load projector weights
+            freeze_projector: If True, freeze projector weights (default). If False, projector is trainable.
+        """
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
-        # Handle different checkpoint formats
+        # Handle different checkpoint formats for backbone
         if "backbone_state_dict" in checkpoint:
-            state_dict = checkpoint["backbone_state_dict"]
+            backbone_state = checkpoint["backbone_state_dict"]
         elif "state_dict" in checkpoint:
             # Extract backbone weights from full model state dict
-            state_dict = {}
+            backbone_state = {}
             for k, v in checkpoint["state_dict"].items():
                 if k.startswith("backbone."):
-                    state_dict[k.replace("backbone.", "")] = v
+                    backbone_state[k.replace("backbone.", "")] = v
         else:
-            state_dict = checkpoint
+            backbone_state = checkpoint
 
         # Load backbone weights
-        missing, unexpected = self.backbone.load_state_dict(state_dict, strict=False)
+        missing, unexpected = self.backbone.load_state_dict(backbone_state, strict=False)
         if missing:
             print(f"Missing keys when loading backbone: {missing}")
         if unexpected:
             print(f"Unexpected keys when loading backbone: {unexpected}")
+
+        # Optionally load and freeze projector
+        if load_projector and self.projector is not None:
+            # Extract projector weights from checkpoint
+            if "student_state_dict" in checkpoint:
+                # Full student model saved
+                student_state = checkpoint["student_state_dict"]
+                projector_state = {}
+                for k, v in student_state.items():
+                    if k.startswith("head."):
+                        # In distillation mode, head is the projector
+                        projector_state[k.replace("head.", "projector.")] = v
+
+                if projector_state:
+                    # Remap keys to match projector structure
+                    final_projector_state = {}
+                    for k, v in projector_state.items():
+                        final_projector_state[k.replace("projector.", "")] = v
+
+                    self.projector.load_state_dict(final_projector_state, strict=False)
+
+                    # Optionally freeze projector weights
+                    if freeze_projector:
+                        for param in self.projector.parameters():
+                            param.requires_grad = False
+                        print("Loaded and froze projector from distillation checkpoint")
+                    else:
+                        print("Loaded projector from distillation checkpoint (trainable)")
+            else:
+                print("Warning: Could not find projector weights in checkpoint")
 
     def get_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extract backbone features without head."""
@@ -127,7 +191,19 @@ class StudentModel(nn.Module):
             embeddings: [B, TEACHER_DIM] if projector mode, [B, num_classes] if classifier
         """
         features = self.get_features(x)
-        out = self.head(features)
+
+        if self.mode == "classifier_with_projector":
+            # Pass through frozen projector, then classifier
+            with torch.no_grad():
+                projected = self.projector(features)  # [B, 1024]
+            out = self.head(projected)  # [B, num_classes]
+        elif self.mode == "classifier_with_trainable_projector":
+            # Pass through trainable projector, then classifier
+            projected = self.projector(features)  # [B, 1024]
+            out = self.head(projected)  # [B, num_classes]
+        else:
+            # Standard path
+            out = self.head(features)
 
         if normalize and self.mode == "projector":
             out = F.normalize(out, p=2, dim=-1)
@@ -157,11 +233,24 @@ class StudentModel(nn.Module):
         cls,
         num_classes: int,
         init_mode: str = "random",
-        checkpoint_path: str = None
+        checkpoint_path: str = None,
+        keep_projector: bool = False,
+        train_projector: bool = False
     ) -> "StudentModel":
-        """Create student model configured for downstream classification."""
+        """
+        Create student model configured for downstream classification.
+
+        Args:
+            num_classes: Number of output classes
+            init_mode: 'random', 'imagenet', or 'distilled'
+            checkpoint_path: Path to distillation checkpoint (for distilled mode)
+            keep_projector: If True, keep projector from distillation
+            train_projector: If True, projector is trainable (requires keep_projector=True)
+        """
         return cls(
             init_mode=init_mode,
             checkpoint_path=checkpoint_path,
-            num_classes=num_classes
+            num_classes=num_classes,
+            keep_projector=keep_projector,
+            train_projector=train_projector
         )

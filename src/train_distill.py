@@ -18,12 +18,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.models.teacher import ImageBindTeacher
 from src.models.student import StudentModel
-from src.data.distill_datasets import get_distill_dataloader
+from src.data.distill_datasets import get_distill_dataloader, get_distill_dataloaders_with_val
 from src.losses.distillation import (
     embedding_loss,
     relational_loss,
     combined_loss,
     compute_similarity_metrics,
+)
+from src.losses.validation_metrics import (
+    validate_distillation,
+    validate_with_linear_probe,
 )
 
 
@@ -32,7 +36,7 @@ def parse_args():
 
     # Data
     parser.add_argument("--dataset", type=str, default="imagenette",
-                        choices=["imagenette", "coco"],
+                        choices=["imagenette", "coco", "imagenet"],
                         help="Distillation dataset")
     parser.add_argument("--data_root", type=str, default="./data",
                         help="Root directory for datasets")
@@ -86,6 +90,18 @@ def parse_args():
                         help="W&B run name")
     parser.add_argument("--no_wandb", action="store_true",
                         help="Disable W&B logging")
+
+    # Validation
+    parser.add_argument("--val_fraction", type=float, default=0.1,
+                        help="Fraction of training data to use for validation")
+    parser.add_argument("--val_every", type=int, default=1,
+                        help="Run validation every N epochs")
+    parser.add_argument("--val_max_batches", type=int, default=50,
+                        help="Max batches for validation (for speed)")
+    parser.add_argument("--probe_every", type=int, default=10,
+                        help="Run linear probe every N epochs (0 to disable)")
+    parser.add_argument("--probe_dataset", type=str, default="imagenette",
+                        help="Dataset for linear probe evaluation")
 
     return parser.parse_args()
 
@@ -249,6 +265,7 @@ def main():
     print(f"Batch size: {args.batch_size}")
     print(f"Learning rate: {args.lr}")
     print(f"Device: {args.device}")
+    print(f"Validation fraction: {args.val_fraction}")
     print("=" * 60)
 
     # Load teacher
@@ -271,16 +288,39 @@ def main():
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
-    # Load data
-    print(f"\nLoading {args.dataset} dataset...")
-    dataloader = get_distill_dataloader(
+    # Load data with train/val split
+    print(f"\nLoading {args.dataset} dataset with validation split...")
+    train_loader, val_loader = get_distill_dataloaders_with_val(
         dataset_name=args.dataset,
         data_root=args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        val_fraction=args.val_fraction,
+        seed=args.seed,
     )
-    print(f"Dataset size: {len(dataloader.dataset)}")
-    print(f"Batches per epoch: {len(dataloader)}")
+    print(f"Train size: {len(train_loader.dataset)}")
+    print(f"Val size: {len(val_loader.dataset)}")
+    print(f"Train batches per epoch: {len(train_loader)}")
+
+    # For backward compatibility
+    dataloader = train_loader
+
+    # Load probe dataset if needed
+    probe_train_loader = None
+    probe_val_loader = None
+    probe_num_classes = None
+    if args.probe_every > 0:
+        print(f"\nLoading {args.probe_dataset} for linear probe evaluation...")
+        from src.data.downstream_datasets import get_downstream_dataloaders
+        probe_train_loader, probe_val_loader, probe_num_classes = get_downstream_dataloaders(
+            dataset_name=args.probe_dataset,
+            data_root=args.data_root,
+            batch_size=64,
+            num_workers=args.num_workers,
+            label_fraction=1.0,
+            seed=args.seed,
+        )
+        print(f"Probe dataset: {args.probe_dataset}, {probe_num_classes} classes")
 
     # Optimizer and scheduler
     optimizer = optim.AdamW(
@@ -298,7 +338,8 @@ def main():
 
     # Training loop
     print("\nStarting training...")
-    best_cos_sim = 0
+    best_val_cos_sim = 0
+    best_train_cos_sim = 0
 
     for epoch in range(1, args.epochs + 1):
         metrics = train_epoch(
@@ -307,22 +348,63 @@ def main():
             args, epoch,
         )
 
+        # Run validation
+        if epoch % args.val_every == 0:
+            print("Running validation...")
+            val_metrics = validate_distillation(
+                teacher=teacher,
+                student=student,
+                val_loader=val_loader,
+                device=args.device,
+                max_batches=args.val_max_batches,
+            )
+            metrics.update(val_metrics)
+
+            # Check for overfitting
+            train_cos = metrics["train/cosine_sim_mean"]
+            val_cos = metrics["val/cosine_mean"]
+            gap = train_cos - val_cos
+            metrics["val/train_val_gap"] = gap
+
+            print(f"  Val cosine: {val_cos:.4f} (train-val gap: {gap:.4f})")
+            print(f"  Val R@1: {metrics['val/retrieval_R@1']:.4f}, R@5: {metrics['val/retrieval_R@5']:.4f}")
+            print(f"  Val RSA corr: {metrics['val/rsa_correlation']:.4f}")
+            print(f"  Backbone eff. rank: {metrics['val/backbone_collapse_effective_rank']:.1f}")
+
+        # Run linear probe periodically
+        if args.probe_every > 0 and epoch % args.probe_every == 0:
+            print("Running linear probe...")
+            probe_metrics = validate_with_linear_probe(
+                student=student,
+                probe_train_loader=probe_train_loader,
+                probe_val_loader=probe_val_loader,
+                num_classes=probe_num_classes,
+                device=args.device,
+            )
+            metrics.update(probe_metrics)
+            print(f"  Probe accuracy: {metrics['val/probe_accuracy']:.4f}")
+
         # Log to W&B
         if not args.no_wandb:
             wandb.log(metrics, step=epoch)
 
         # Print epoch summary
         print(f"\nEpoch {epoch}/{args.epochs}")
-        print(f"  Loss: {metrics['train/loss']:.4f}")
-        print(f"  Cosine sim: {metrics['train/cosine_sim_mean']:.4f}")
+        print(f"  Train Loss: {metrics['train/loss']:.4f}")
+        print(f"  Train Cosine sim: {metrics['train/cosine_sim_mean']:.4f}")
 
-        # Save best model
-        if metrics["train/cosine_sim_mean"] > best_cos_sim:
-            best_cos_sim = metrics["train/cosine_sim_mean"]
+        # Save best model based on validation cosine similarity
+        val_cos_sim = metrics.get("val/cosine_mean", metrics["train/cosine_sim_mean"])
+        if val_cos_sim > best_val_cos_sim:
+            best_val_cos_sim = val_cos_sim
             save_checkpoint(
                 student, optimizer, scheduler, epoch, args,
                 f"{args.dataset}_distilled_best.pth"
             )
+
+        # Track best training cosine sim
+        if metrics["train/cosine_sim_mean"] > best_train_cos_sim:
+            best_train_cos_sim = metrics["train/cosine_sim_mean"]
 
         # Save periodic checkpoints
         if epoch % args.save_every == 0:
@@ -339,7 +421,8 @@ def main():
 
     print("\n" + "=" * 60)
     print("Training complete!")
-    print(f"Best cosine similarity: {best_cos_sim:.4f}")
+    print(f"Best train cosine similarity: {best_train_cos_sim:.4f}")
+    print(f"Best val cosine similarity: {best_val_cos_sim:.4f}")
     print(f"Checkpoints saved to: {args.output_dir}")
     print("=" * 60)
 

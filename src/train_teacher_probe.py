@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Downstream fine-tuning on classification tasks."""
+"""Train linear probes on frozen ImageBind embeddings (teacher oracle baseline)."""
 
 import argparse
 import os
@@ -9,7 +9,6 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import wandb
 import numpy as np
@@ -17,12 +16,12 @@ import numpy as np
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.models.student import StudentModel
+from src.models.teacher import ImageBindTeacher
 from src.data.downstream_datasets import get_downstream_dataloaders, get_num_classes
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Downstream fine-tuning")
+    parser = argparse.ArgumentParser(description="Teacher oracle linear probe")
 
     # Data
     parser.add_argument("--dataset", type=str, required=True,
@@ -33,17 +32,6 @@ def parse_args():
     parser.add_argument("--label_fraction", type=float, default=1.0,
                         choices=[0.01, 0.1, 1.0],
                         help="Fraction of training labels to use")
-
-    # Model initialization
-    parser.add_argument("--init", type=str, default="random",
-                        choices=["random", "imagenet", "distilled"],
-                        help="Weight initialization mode")
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Path to distilled checkpoint (required if init=distilled)")
-    parser.add_argument("--keep_projector", action="store_true",
-                        help="Keep projector from distillation (only with init=distilled)")
-    parser.add_argument("--train_projector", action="store_true",
-                        help="Make projector trainable (requires --keep_projector)")
 
     # Training
     parser.add_argument("--epochs", type=int, default=50,
@@ -56,8 +44,6 @@ def parse_args():
                         help="SGD momentum")
     parser.add_argument("--weight_decay", type=float, default=1e-4,
                         help="Weight decay")
-    parser.add_argument("--warmup_epochs", type=int, default=5,
-                        help="Number of warmup epochs")
 
     # System
     parser.add_argument("--num_workers", type=int, default=8,
@@ -66,8 +52,6 @@ def parse_args():
                         help="Random seed")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device to use")
-    parser.add_argument("--amp", action="store_true",
-                        help="Use automatic mixed precision")
 
     # Output
     parser.add_argument("--output_dir", type=str, default="./checkpoints",
@@ -81,13 +65,7 @@ def parse_args():
     parser.add_argument("--no_wandb", action="store_true",
                         help="Disable W&B logging")
 
-    args = parser.parse_args()
-
-    # Validation
-    if args.init == "distilled" and args.checkpoint is None:
-        parser.error("--checkpoint is required when --init=distilled")
-
-    return args
+    return parser.parse_args()
 
 
 def set_seed(seed: int):
@@ -100,57 +78,54 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def get_lr_scheduler(optimizer, num_epochs, warmup_epochs, steps_per_epoch):
-    """Create learning rate scheduler with warmup and cosine decay."""
+@torch.no_grad()
+def extract_embeddings(teacher, dataloader, device):
+    """Extract ImageBind embeddings for entire dataset."""
+    embeddings = []
+    labels = []
 
-    def lr_lambda(step):
-        warmup_steps = warmup_epochs * steps_per_epoch
-        total_steps = num_epochs * steps_per_epoch
+    print("Extracting embeddings...")
+    for images, targets in tqdm(dataloader, desc="Extracting"):
+        images = images.to(device, non_blocking=True)
+        embs = teacher.encode(images)  # [B, 1024], L2-normalized
+        embeddings.append(embs.cpu())
+        labels.append(targets)
 
-        # Guard against division by zero for very small datasets
-        if warmup_steps == 0:
-            warmup_steps = 1
-        if total_steps <= warmup_steps:
-            total_steps = warmup_steps + 1
+    embeddings = torch.cat(embeddings, dim=0)
+    labels = torch.cat(labels, dim=0)
 
-        if step < warmup_steps:
-            return step / warmup_steps
-        else:
-            progress = (step - warmup_steps) / (total_steps - warmup_steps)
-            return 0.5 * (1 + np.cos(progress * np.pi))
-
-    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    print(f"Extracted {len(embeddings)} embeddings of shape {embeddings.shape}")
+    return embeddings, labels
 
 
-def train_epoch(model, dataloader, criterion, optimizer, scheduler, scaler, device, amp):
-    """Train for one epoch."""
-    model.train()
+def train_epoch(probe, train_embs, train_labels, criterion, optimizer, device):
+    """Train linear probe for one epoch."""
+    probe.train()
     total_loss = 0
     correct = 0
     total = 0
 
-    for images, labels in tqdm(dataloader, desc="Train", leave=False):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+    # Create mini-batches
+    batch_size = 256
+    num_batches = (len(train_embs) + batch_size - 1) // batch_size
+
+    indices = torch.randperm(len(train_embs))
+
+    for i in range(num_batches):
+        start_idx = i * batch_size
+        end_idx = min((i + 1) * batch_size, len(train_embs))
+        batch_indices = indices[start_idx:end_idx]
+
+        embs = train_embs[batch_indices].to(device)
+        labels = train_labels[batch_indices].to(device)
 
         optimizer.zero_grad()
+        outputs = probe(embs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
 
-        if amp:
-            with autocast():
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-        scheduler.step()
-
-        total_loss += loss.item() * images.size(0)
+        total_loss += loss.item() * embs.size(0)
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
@@ -161,21 +136,28 @@ def train_epoch(model, dataloader, criterion, optimizer, scheduler, scaler, devi
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, criterion, device):
-    """Evaluate model on validation set."""
-    model.eval()
+def evaluate_probe(probe, val_embs, val_labels, criterion, device):
+    """Evaluate linear probe."""
+    probe.eval()
     total_loss = 0
     correct = 0
     total = 0
 
-    for images, labels in tqdm(dataloader, desc="Eval", leave=False):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+    # Evaluate in batches to avoid OOM
+    batch_size = 256
+    num_batches = (len(val_embs) + batch_size - 1) // batch_size
 
-        outputs = model(images)
+    for i in range(num_batches):
+        start_idx = i * batch_size
+        end_idx = min((i + 1) * batch_size, len(val_embs))
+
+        embs = val_embs[start_idx:end_idx].to(device)
+        labels = val_labels[start_idx:end_idx].to(device)
+
+        outputs = probe(embs)
         loss = criterion(outputs, labels)
 
-        total_loss += loss.item() * images.size(0)
+        total_loss += loss.item() * embs.size(0)
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
@@ -201,22 +183,20 @@ def main():
 
     # Initialize W&B
     if not args.no_wandb:
-        run_name = args.wandb_run_name or f"{args.dataset}_{args.init}_frac{args.label_fraction}_s{args.seed}"
+        run_name = args.wandb_run_name or f"{args.dataset}_teacher_oracle_frac{args.label_fraction}_s{args.seed}"
         wandb.init(
             project=args.wandb_project,
             name=run_name,
             config=vars(args),
-            tags=["downstream", args.dataset, args.init, f"frac{args.label_fraction}"],
+            tags=["teacher_oracle", args.dataset, f"frac{args.label_fraction}"],
         )
 
     print("=" * 60)
-    print("Downstream Fine-tuning")
+    print("Teacher Oracle Linear Probe")
     print("=" * 60)
     print(f"Dataset: {args.dataset}")
-    print(f"Init: {args.init}")
     print(f"Label fraction: {args.label_fraction}")
     print(f"Epochs: {args.epochs}")
-    print(f"Batch size: {args.batch_size}")
     print(f"Learning rate: {args.lr}")
     print(f"Seed: {args.seed}")
     print("=" * 60)
@@ -225,26 +205,10 @@ def main():
     num_classes = get_num_classes(args.dataset)
     print(f"\nNumber of classes: {num_classes}")
 
-    # Create model
-    print(f"\nCreating model with {args.init} initialization...")
-    if args.keep_projector:
-        if args.train_projector:
-            print("Keeping TRAINABLE projector from distillation")
-        else:
-            print("Keeping FROZEN projector from distillation")
-    model = StudentModel.for_downstream(
-        num_classes=num_classes,
-        init_mode=args.init,
-        checkpoint_path=args.checkpoint,
-        keep_projector=args.keep_projector,
-        train_projector=args.train_projector,
-    ).to(args.device)
-
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    # Load frozen ImageBind teacher
+    print("\nLoading ImageBind teacher model...")
+    teacher = ImageBindTeacher(device=args.device).load()
+    print("Teacher model loaded and frozen")
 
     # Load data
     print(f"\nLoading {args.dataset} dataset...")
@@ -259,21 +223,23 @@ def main():
     print(f"Training samples: {len(train_loader.dataset)}")
     print(f"Validation samples: {len(val_loader.dataset)}")
 
-    # Loss, optimizer, scheduler
+    # Extract embeddings once (teacher is frozen)
+    train_embs, train_labels = extract_embeddings(teacher, train_loader, args.device)
+    val_embs, val_labels = extract_embeddings(teacher, val_loader, args.device)
+
+    # Create linear probe
+    probe = nn.Linear(1024, num_classes).to(args.device)
+    print(f"\nLinear probe: {1024} → {num_classes}")
+    print(f"Trainable parameters: {sum(p.numel() for p in probe.parameters()):,}")
+
+    # Setup training
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(
-        model.parameters(),
+        probe.parameters(),
         lr=args.lr,
         momentum=args.momentum,
         weight_decay=args.weight_decay,
     )
-    scheduler = get_lr_scheduler(
-        optimizer,
-        args.epochs,
-        args.warmup_epochs,
-        len(train_loader),
-    )
-    scaler = GradScaler() if args.amp else None
 
     # Training loop
     print("\nStarting training...")
@@ -283,11 +249,13 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_acc = train_epoch(
-            model, train_loader, criterion,
-            optimizer, scheduler, scaler,
-            args.device, args.amp,
+            probe, train_embs, train_labels,
+            criterion, optimizer, args.device
         )
-        val_loss, val_acc = evaluate(model, val_loader, criterion, args.device)
+        val_loss, val_acc = evaluate_probe(
+            probe, val_embs, val_labels,
+            criterion, args.device
+        )
 
         val_accuracies.append(val_acc)
 
@@ -343,22 +311,16 @@ def main():
     print("=" * 60)
 
     # Save results to CSV
-    if args.keep_projector:
-        suffix = "_trainproj" if args.train_projector else "_keepproj"
-    else:
-        suffix = ""
     results_path = os.path.join(
         args.output_dir,
-        f"results_{args.dataset}_{args.init}{suffix}_frac{args.label_fraction}_s{args.seed}.csv"
+        f"results_{args.dataset}_teacher_oracle_frac{args.label_fraction}_s{args.seed}.csv"
     )
     import pandas as pd
     results_df = pd.DataFrame([{
         "dataset": args.dataset,
-        "init": args.init,
+        "init": "teacher_oracle",
         "label_fraction": args.label_fraction,
         "seed": args.seed,
-        "keep_projector": args.keep_projector,
-        "train_projector": args.train_projector,
         "best_acc": best_acc,
         "final_acc": val_accuracies[-1],
         "aulc": aulc,

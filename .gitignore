@@ -13,11 +13,11 @@ venv/
 env/
 ENV/
 
-# Data and checkpoints
-data/
-checkpoints/
-.checkpoints/
-results/
+# Data and checkpoints (exclude top-level only)
+/data/
+/checkpoints/
+/.checkpoints/
+/results/
 
 # Wandb
 wandb/

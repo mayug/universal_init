@@ -241,14 +241,17 @@ def get_downstream_dataloaders(
         )
         print(f"Using {len(train_dataset)} training samples ({label_fraction*100:.0f}%)")
 
+    # Adjust batch size if needed for very small datasets
+    effective_batch_size = min(batch_size, len(train_dataset))
+
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=effective_batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True,
+        drop_last=len(train_dataset) > effective_batch_size,  # Only drop if we have multiple batches
     )
 
     val_loader = DataLoader(
