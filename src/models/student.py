@@ -241,6 +241,7 @@ class StudentModel(nn.Module):
         keep_projector: bool = False,
         train_projector: bool = False,
         teacher_dim: int = 1024,
+        freeze_backbone: bool = False,
     ) -> "StudentModel":
         """
         Create student model configured for downstream classification.
@@ -252,8 +253,9 @@ class StudentModel(nn.Module):
             keep_projector: If True, keep projector from distillation
             train_projector: If True, projector is trainable (requires keep_projector=True)
             teacher_dim: Teacher embedding dimension (must match checkpoint)
+            freeze_backbone: If True, freeze backbone for linear probing
         """
-        return cls(
+        model = cls(
             init_mode=init_mode,
             checkpoint_path=checkpoint_path,
             num_classes=num_classes,
@@ -261,3 +263,7 @@ class StudentModel(nn.Module):
             train_projector=train_projector,
             teacher_dim=teacher_dim,
         )
+        if freeze_backbone:
+            for param in model.backbone.parameters():
+                param.requires_grad = False
+        return model

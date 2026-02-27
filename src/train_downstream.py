@@ -48,6 +48,8 @@ def parse_args():
                         help="Teacher embedding dim (auto-detected from checkpoint if not set)")
     parser.add_argument("--teacher_name", type=str, default=None,
                         help="Teacher name for result filenames (auto-detected from checkpoint)")
+    parser.add_argument("--freeze_backbone", action="store_true",
+                        help="Freeze backbone for linear probing (only train classifier head)")
 
     # Training
     parser.add_argument("--epochs", type=int, default=50,
@@ -126,9 +128,11 @@ def get_lr_scheduler(optimizer, num_epochs, warmup_epochs, steps_per_epoch):
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def train_epoch(model, dataloader, criterion, optimizer, scheduler, scaler, device, amp):
+def train_epoch(model, dataloader, criterion, optimizer, scheduler, scaler, device, amp, freeze_backbone=False):
     """Train for one epoch."""
     model.train()
+    if freeze_backbone:
+        model.backbone.eval()  # Keep BN running stats frozen for linear probing
     total_loss = 0
     correct = 0
     total = 0
@@ -223,6 +227,8 @@ def main():
     print(f"Batch size: {args.batch_size}")
     print(f"Learning rate: {args.lr}")
     print(f"Seed: {args.seed}")
+    if args.freeze_backbone:
+        print(f"Mode: LINEAR PROBE (backbone frozen)")
     print("=" * 60)
 
     # Get number of classes
@@ -261,6 +267,7 @@ def main():
         keep_projector=args.keep_projector,
         train_projector=args.train_projector,
         teacher_dim=teacher_dim,
+        freeze_backbone=args.freeze_backbone,
     ).to(args.device)
 
     # Count parameters
@@ -285,7 +292,7 @@ def main():
     # Loss, optimizer, scheduler
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(
-        model.parameters(),
+        filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
         momentum=args.momentum,
         weight_decay=args.weight_decay,
@@ -309,6 +316,7 @@ def main():
             model, train_loader, criterion,
             optimizer, scheduler, scaler,
             args.device, args.amp,
+            freeze_backbone=args.freeze_backbone,
         )
         val_loss, val_acc = evaluate(model, val_loader, criterion, args.device)
 
@@ -366,7 +374,9 @@ def main():
     print("=" * 60)
 
     # Save results to CSV
-    if args.keep_projector:
+    if args.freeze_backbone:
+        suffix = "_linprobe"
+    elif args.keep_projector:
         suffix = "_trainproj" if args.train_projector else "_keepproj"
     else:
         suffix = ""
@@ -385,6 +395,7 @@ def main():
         "seed": args.seed,
         "keep_projector": args.keep_projector,
         "train_projector": args.train_projector,
+        "freeze_backbone": args.freeze_backbone,
         "best_acc": best_acc,
         "final_acc": val_accuracies[-1],
         "aulc": aulc,

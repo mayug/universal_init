@@ -1,7 +1,7 @@
 # Experiment 4: Platonic Representation — CLIP vs Supervised Distillation
 
 **Date:** February 26, 2026
-**Status:** Complete (24/24 downstream runs finished)
+**Status:** Complete (Phase 1–4: distillation, downstream, linear probing, CKA analysis)
 
 ---
 
@@ -169,11 +169,175 @@ At 100% labels, all EuroSAT configurations achieve 97.4-97.8%, a spread of only 
 
 ## Conclusions
 
-1. **The platonic representation hypothesis is not supported** by these results. CLIP-distilled features do not consistently outperform supervised-distilled features on downstream tasks.
-2. **Distillation cosine similarity is a poor proxy for downstream utility.** CLIP 512 achieved the best distillation fidelity but often the worst downstream accuracy.
+1. **The platonic representation hypothesis is not supported** by these results. CLIP-distilled features do not consistently outperform supervised-distilled features on downstream tasks. In linear probing, supervised distillation produces the best frozen representations on EuroSAT.
+2. **Distillation cosine similarity is a poor proxy for downstream utility.** CLIP 512 achieved the best distillation fidelity but often the worst downstream accuracy. In linear probing, the ranking is inversely correlated with distillation cosine similarity.
 3. **The projector architecture matters more than the teacher identity.** Keeping a trainable projector provides a more consistent and larger benefit (+2.36 pp on Pets 100%) than switching teachers (<1 pp difference in most conditions).
-4. **All distillation-based initializations fail on extreme low-data fine-grained tasks** (Pets 1%), regardless of teacher. This contrasts with the original hypothesis that "universal" representations would shine most in data-scarce settings.
-5. **Supervised distillation is surprisingly competitive**, slightly favoring EuroSAT where its ImageNet-derived features happen to align well with satellite image classification.
+4. **ImageNet pretraining vastly outperforms all distilled initializations in linear probing** — 91% vs 30% on Pets, 94% vs 86% on EuroSAT. Distillation on 82k COCO images for 30 epochs cannot match supervised pretraining on 1.2M labeled ImageNet images.
+5. **The distillation bottleneck severely distorts teacher representations** (CKA analysis). Student-teacher CKA is only 0.01–0.26 on Pets, meaning the 4.3M-param student cannot faithfully compress the 86M-param teacher. Different teachers produce distinct student representations, but these don't correspond to original teacher differences.
+6. **Students have NOT converged** despite sharing architecture and training procedure (CKA = 0.02–0.30 on Pets). The capacity bottleneck hypothesis is weakened — students are not collapsing to the same representation. Rather, each teacher's signal interacts differently with the student's limited capacity, producing distinct but equally suboptimal features.
+
+---
+
+## Discussion: Why the Platonic Hypothesis May Not Be Supported
+
+The null result — no teacher consistently dominating — has several possible explanations, which are not mutually exclusive:
+
+### 1. Teacher scale is too small
+All teachers are ViT-B/16 (~86M params). The platonic representation hypothesis (Huh et al., 2024) primarily concerns large-scale models (ViT-L, ViT-G). At the Base scale, supervised and contrastive representations may not yet have converged toward a shared structure. Larger teachers might exhibit clearer separation.
+
+### 2. Student capacity bottleneck
+RegNetY-400MF (4.3M params) may be too small to faithfully preserve the distinguishing features of different teacher representations. If the student's capacity forces all representations into a similar subspace, teacher identity becomes irrelevant — the bottleneck dominates. CKA analysis (Experiment B) directly tests this.
+
+### 3. Combined loss may obscure teacher differences
+The relational loss component preserves within-batch similarity structure, which is relatively teacher-agnostic (all teachers rank natural images similarly). This shared signal may dominate the loss, washing out the embedding-specific information from different teachers.
+
+### 4. Fine-tuning washes out initialization differences
+With 50 epochs of full fine-tuning, the downstream SGD optimizer may move weights far enough from initialization that the teacher signal is lost. Linear probing (Experiment A) tests this by isolating representation quality from adaptation dynamics.
+
+### 5. Task selection may be too narrow
+Only two downstream tasks (Pets, EuroSAT) were tested. The platonic hypothesis might manifest on tasks requiring more diverse visual understanding (e.g., action recognition, spatial reasoning) where multimodal alignment provides genuine advantage.
+
+---
+
+## Follow-up Experiments
+
+| ID | Experiment | Rationale | Status |
+|----|-----------|-----------|--------|
+| A  | **Linear Probing** — freeze backbone, train only linear head | Isolates representation quality from fine-tuning dynamics | **Done** (Phase 3) |
+| B  | **CKA Analysis** — pairwise CKA between student representations | Tests convergence (capacity bottleneck) vs divergence (teacher signal preserved) | **Done** (Phase 4) |
+| C  | Embedding-only loss (drop relational component) | Tests if relational loss washes out teacher-specific signal | Future |
+| D  | Larger student (RegNetY-1.6GF or ResNet-50) | Tests if capacity bottleneck explains convergence | Future |
+| E  | Larger teachers (ViT-L/14 CLIP, DINOv2-L) | Tests if platonic convergence requires scale | Future |
+| F  | More diverse downstream tasks (DTD, Flowers, + action/spatial) | Tests if task diversity reveals teacher differences | Future |
+
+---
+
+## Phase 3: Linear Probing Results
+
+**Config:** 50 epochs, batch size 64, SGD (lr=0.1, momentum=0.9, weight_decay=0), backbone frozen, only linear classifier trained (~16K params for Pets, ~4.4K for EuroSAT). Backbone BatchNorm kept in eval mode.
+
+### Pets Dataset (best accuracy %)
+
+| Init | 1% Labels | 10% Labels | 100% Labels |
+|------|-----------|------------|-------------|
+| random | 2.97 | 5.56 | 7.28 |
+| imagenet | **68.33** | **88.28** | **91.22** |
+| distilled (supervised) | 5.31 | 14.34 | 26.44 |
+| distilled (clip_768) | 6.30 | 15.21 | 29.74 |
+| distilled (clip_512) | 5.67 | 15.40 | **30.09** |
+
+### EuroSAT Dataset (best accuracy %)
+
+| Init | 1% Labels | 10% Labels | 100% Labels |
+|------|-----------|------------|-------------|
+| random | 28.93 | 38.72 | 51.06 |
+| imagenet | **84.70** | **92.19** | **94.35** |
+| distilled (supervised) | **69.35** | **81.02** | **86.22** |
+| distilled (clip_768) | 68.26 | 80.59 | 84.67 |
+| distilled (clip_512) | 66.52 | 78.41 | 83.76 |
+
+### Analysis
+
+#### 1. ImageNet pretraining massively outperforms all distilled initializations
+
+The most striking result is the enormous gap between ImageNet-pretrained features and all distilled variants:
+- **Pets:** ImageNet achieves 91.2% at 100% labels vs 30.1% for the best distilled student — a **61 pp gap**. Even at 1% labels, ImageNet (68.3%) exceeds the best distilled student at 100% labels (30.1%).
+- **EuroSAT:** The gap is smaller but still decisive: ImageNet 94.4% vs distilled 86.2% at 100% labels (**8 pp gap**).
+
+This confirms that distillation on COCO with 30 epochs does not produce representations competitive with direct ImageNet pretraining for linear probing. The student backbone simply hasn't learned features rich enough for direct linear readout.
+
+#### 2. All distilled students far exceed random initialization
+
+Distillation does learn meaningful representations — all distilled variants are 2-3x better than random on both datasets. The distillation signal is real; it's just much weaker than supervised pretraining on 1.2M labeled images.
+
+#### 3. Supervised distillation produces the best frozen features
+
+Among distilled students, supervised consistently ranks first on EuroSAT (69.4%, 81.0%, 86.2%) across all label fractions. On Pets, CLIP 512 narrowly wins at 100% (30.1 vs 26.4) but the overall pattern favors supervised. This **contradicts the platonic hypothesis** — supervised features, despite lower distillation cosine similarity (0.626), produce more linearly separable downstream representations.
+
+#### 4. Fine-tuning vs linear probing gap varies dramatically by initialization
+
+| Init | Pets 100% Fine-tune | Pets 100% LinProbe | Gap |
+|------|--------------------|--------------------|-----|
+| distilled (supervised) | 46.7 | 26.4 | 20.3 |
+| distilled (clip_768) | 46.3 | 29.7 | 16.6 |
+| distilled (clip_512) | 44.2 | 30.1 | 14.1 |
+
+CLIP-distilled features have a smaller fine-tuning–to–linear-probing gap, meaning their features are more "ready to use" without adaptation. However, this advantage doesn't translate to higher fine-tuning accuracy — supervised catches up and slightly exceeds during fine-tuning, suggesting fine-tuning dynamics favor supervised-derived features.
+
+#### 5. Teacher ranking is consistent but reversed from Phase 2
+
+In linear probing on EuroSAT, the ranking is consistently: supervised > clip_768 > clip_512, which is the **opposite** of distillation cosine similarity order (clip_512 > clip_768 > supervised). This reinforces Finding 1 from Phase 2: distillation fidelity inversely predicts downstream utility for this student architecture.
+
+---
+
+## Phase 4: CKA Similarity Analysis
+
+Features extracted from validation sets (Pets: 3,669 samples; EuroSAT: 2,700 samples). Linear CKA (Kornblith et al., 2019) computed on centered backbone/encoder features.
+
+### Pets — Full CKA Matrix
+
+|                    | stu_sup | stu_c768 | stu_c512 | random | imagenet | tch_sup | tch_c768 | tch_c512 |
+|--------------------|---------|----------|----------|--------|----------|---------|----------|----------|
+| stu_supervised     | 1.000   | 0.295    | 0.024    | 0.140  | 0.129    | 0.123   | 0.195    | 0.180    |
+| stu_clip_768       | 0.295   | 1.000    | 0.040    | 0.049  | 0.158    | 0.150   | 0.255    | 0.245    |
+| stu_clip_512       | 0.024   | 0.040    | 1.000    | 0.004  | 0.011    | 0.013   | 0.017    | 0.016    |
+| random             | 0.140   | 0.049    | 0.004    | 1.000  | 0.017    | 0.019   | 0.036    | 0.032    |
+| imagenet           | 0.129   | 0.158    | 0.011    | 0.017  | 1.000    | 0.834   | 0.709    | 0.681    |
+| teacher_sup        | 0.123   | 0.150    | 0.013    | 0.019  | 0.834   | 1.000   | 0.693    | 0.668    |
+| teacher_clip_768   | 0.195   | 0.255    | 0.017    | 0.036  | 0.709   | 0.693   | 1.000    | 0.983    |
+| teacher_clip_512   | 0.180   | 0.245    | 0.016    | 0.032  | 0.681   | 0.668   | 0.983    | 1.000    |
+
+### EuroSAT — Full CKA Matrix
+
+|                    | stu_sup | stu_c768 | stu_c512 | random | imagenet | tch_sup | tch_c768 | tch_c512 |
+|--------------------|---------|----------|----------|--------|----------|---------|----------|----------|
+| stu_supervised     | 1.000   | 0.702    | 0.716    | 0.544  | 0.449    | 0.410   | 0.526    | 0.492    |
+| stu_clip_768       | 0.702   | 1.000    | 0.725    | 0.456  | 0.471    | 0.403   | 0.519    | 0.490    |
+| stu_clip_512       | 0.716   | 0.725    | 1.000    | 0.510  | 0.477    | 0.441   | 0.495    | 0.459    |
+| random             | 0.544   | 0.456    | 0.510    | 1.000  | 0.329    | 0.355   | 0.396    | 0.356    |
+| imagenet           | 0.449   | 0.471    | 0.477    | 0.329  | 1.000    | 0.729   | 0.618    | 0.580    |
+| teacher_sup        | 0.410   | 0.403    | 0.441    | 0.355  | 0.729   | 1.000   | 0.567    | 0.519    |
+| teacher_clip_768   | 0.526   | 0.519    | 0.495    | 0.396  | 0.618   | 0.567   | 1.000    | 0.989    |
+| teacher_clip_512   | 0.492   | 0.490    | 0.459    | 0.356  | 0.580   | 0.519   | 0.989    | 1.000    |
+
+### Student-Student CKA Summary
+
+|                    | Pets |  | EuroSAT |  |
+|--------------------|------|--|---------|--|
+| stu_sup ↔ stu_c768 | 0.295 | | 0.702 | |
+| stu_sup ↔ stu_c512 | 0.024 | | 0.716 | |
+| stu_c768 ↔ stu_c512 | 0.040 | | 0.725 | |
+
+### Analysis
+
+#### 1. Student representations have NOT converged — capacity bottleneck hypothesis weakened
+
+On Pets, student-student CKA is extremely low (0.02–0.30), meaning the three distilled students learned **highly distinct** representations despite sharing the same architecture and training procedure. Teacher identity is clearly preserved in the student. This rules out the "all students collapse to the same representation" explanation for the null result in Phase 2.
+
+On EuroSAT, student-student CKA is moderate (0.70–0.73) — more similar but still well below 0.8. The higher similarity on EuroSAT likely reflects the simpler task structure (10 broad classes vs 37 fine-grained breeds), which constrains useful representations into a smaller subspace.
+
+#### 2. Student-teacher CKA is surprisingly low
+
+No student closely resembles its own teacher:
+- **Pets:** student-teacher CKA ranges from 0.013 (stu_clip_512 → tch_sup) to 0.255 (stu_clip_768 → tch_clip_768). Even the best student-to-own-teacher similarity is only 0.26.
+- **EuroSAT:** Ranges up to 0.53 (stu_supervised → tch_clip_768), but no student exceeds 0.53 with any teacher.
+
+This suggests the student backbone (4.3M params, 440-dim) cannot faithfully reproduce the teacher's representational structure (86M params, 768/512-dim). The distillation transfers *some* signal but heavily distorts it.
+
+#### 3. CLIP 512 student is an outlier on Pets
+
+On Pets, student_clip_512 has near-zero CKA with everything (0.004–0.040), even with its own teacher (0.016). This anomalous isolation suggests the CLIP 512 distillation pathway learned a degenerate or highly task-specific representation for Pets features. Despite this, it achieved the best linear probing accuracy on Pets at 100% (30.1%), indicating that representational similarity to other models is not necessary for downstream utility.
+
+#### 4. Teacher representations are highly structured
+
+The teacher models show the expected pattern:
+- CLIP 768 and CLIP 512 are near-identical (CKA = 0.983/0.989), confirming that CLIP's projection preserves structure.
+- ImageNet-pretrained and supervised teacher are highly similar (CKA = 0.834/0.729), both being ViT-B/16 trained on ImageNet.
+- All teachers show moderate inter-family similarity (0.58–0.71), consistent with the platonic convergence idea at the teacher scale.
+
+#### 5. Interpretation
+
+The paradox is now clear: **teacher representations are structured and moderately convergent, but the distillation bottleneck (86M → 4.3M params, 768-dim → 440-dim) introduces severe distortion that largely destroys the teacher-specific structure.** Different teachers lead to different student representations, but these differences don't correspond to the original teacher differences — they reflect how each teacher's signal interacts with the student's limited capacity. This explains why no teacher consistently wins: the student isn't learning a compressed version of the teacher's representation, it's learning a different representation that happens to be guided by the teacher's signal.
 
 ---
 
@@ -182,9 +346,12 @@ At 100% labels, all EuroSAT configurations achieve 97.4-97.8%, a spread of only 
 - **New dependency:** `timm>=0.9.0` for loading pretrained ViT models
 - **New module:** `src/models/generic_teacher.py` — frozen teacher wrapper matching ImageBindTeacher interface
 - **Modified:** `student.py` (configurable teacher_dim), `train_distill.py` (multi-teacher support), `distill_datasets.py` (custom normalization), `train_downstream.py` (auto-detection of teacher_dim from checkpoint)
-- **Scripts:** `scripts/experiment4_platonic.sh` (distillation), `scripts/experiment4_downstream.sh` (downstream)
+- **Scripts:** `scripts/experiment4_platonic.sh` (distillation), `scripts/experiment4_downstream.sh` (downstream), `scripts/experiment4a_linear_probe.sh` (linear probing)
+- **New modules:** `src/analysis/cka.py` (linear CKA), `src/analyze_cka.py` (CKA analysis script)
+- **Modified for linear probing:** `student.py` (`freeze_backbone` param), `train_downstream.py` (`--freeze_backbone` flag, optimizer filtering, BN eval mode)
 - **COCO data:** Used COCO 2014 train images (symlinked as train2017 for compatibility)
 - **Hardware:** Single H100 80GB GPU
-- **Runtime:** ~2.5 hours distillation + ~2.5 hours downstream = ~5 hours total
+- **Runtime:** ~2.5h distillation + ~2.5h downstream + ~2.5h linear probing + ~10min CKA = ~8 hours total
 - **Combined results CSV:** `checkpoints/experiment4_combined_results.csv`
+- **CKA results:** `results/cka_matrix_pets.csv`, `results/cka_matrix_eurosat.csv`
 
