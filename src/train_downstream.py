@@ -18,7 +18,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.models.student import StudentModel
-from src.data.downstream_datasets import get_downstream_dataloaders, get_num_classes
+from src.data.downstream_datasets import get_downstream_dataloaders, get_num_classes, is_multilabel_dataset
 
 
 def parse_args():
@@ -26,7 +26,7 @@ def parse_args():
 
     # Data
     parser.add_argument("--dataset", type=str, required=True,
-                        choices=["pets", "flowers102", "dtd", "eurosat", "imagenette"],
+                        choices=["pets", "flowers102", "dtd", "eurosat", "imagenette", "voc"],
                         help="Downstream dataset")
     parser.add_argument("--data_root", type=str, default="./data",
                         help="Root directory for datasets")
@@ -200,6 +200,75 @@ def compute_aulc(accuracies: list) -> float:
     return np.trapz(accuracies) / (len(accuracies) - 1)
 
 
+def compute_map(all_targets, all_scores):
+    """Compute mean Average Precision for multi-label classification."""
+    from sklearn.metrics import average_precision_score
+    per_class_ap = average_precision_score(all_targets, all_scores, average=None)
+    return float(np.nanmean(per_class_ap))
+
+
+def train_epoch_multilabel(model, dataloader, criterion, optimizer, scheduler, scaler, device, amp, freeze_backbone=False):
+    """Train for one epoch (multi-label)."""
+    model.train()
+    if freeze_backbone:
+        model.backbone.eval()
+    total_loss = 0
+    total = 0
+
+    for images, labels in tqdm(dataloader, desc="Train", leave=False):
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+
+        if amp:
+            with autocast():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+        scheduler.step()
+
+        total_loss += loss.item() * images.size(0)
+        total += images.size(0)
+
+    return total_loss / total if total > 0 else 0.0
+
+
+@torch.no_grad()
+def evaluate_multilabel(model, dataloader, criterion, device):
+    """Evaluate model on validation set (multi-label, returns mAP)."""
+    model.eval()
+    total_loss = 0
+    total = 0
+    all_targets = []
+    all_scores = []
+
+    for images, labels in tqdm(dataloader, desc="Eval", leave=False):
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+
+        total_loss += loss.item() * images.size(0)
+        total += images.size(0)
+        all_targets.append(labels.cpu().numpy())
+        all_scores.append(outputs.cpu().numpy())
+
+    all_targets = np.concatenate(all_targets, axis=0)
+    all_scores = np.concatenate(all_scores, axis=0)
+    mAP = compute_map(all_targets, all_scores)
+    return total_loss / total if total > 0 else 0.0, mAP * 100.0
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -289,8 +358,11 @@ def main():
     print(f"Training samples: {len(train_loader.dataset)}")
     print(f"Validation samples: {len(val_loader.dataset)}")
 
+    # Determine if multi-label
+    multilabel = is_multilabel_dataset(args.dataset)
+
     # Loss, optimizer, scheduler
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.BCEWithLogitsLoss() if multilabel else nn.CrossEntropyLoss()
     optimizer = optim.SGD(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
@@ -305,59 +377,77 @@ def main():
     )
     scaler = GradScaler() if args.amp else None
 
+    # Metric name for multi-label vs single-label
+    metric_name = "mAP" if multilabel else "Acc"
+
     # Training loop
     print("\nStarting training...")
-    best_acc = 0
-    val_accuracies = []
-    milestone_accs = {}  # Accuracy at epoch 5, 10, 20
+    best_metric = 0
+    val_metrics = []
+    milestone_vals = {}  # Metric at epoch 5, 10, 20
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = train_epoch(
-            model, train_loader, criterion,
-            optimizer, scheduler, scaler,
-            args.device, args.amp,
-            freeze_backbone=args.freeze_backbone,
-        )
-        val_loss, val_acc = evaluate(model, val_loader, criterion, args.device)
+        if multilabel:
+            train_loss = train_epoch_multilabel(
+                model, train_loader, criterion,
+                optimizer, scheduler, scaler,
+                args.device, args.amp,
+                freeze_backbone=args.freeze_backbone,
+            )
+            val_loss, val_metric = evaluate_multilabel(
+                model, val_loader, criterion, args.device,
+            )
+            train_metric = None  # mAP not computed per-batch during training
+        else:
+            train_loss, train_metric = train_epoch(
+                model, train_loader, criterion,
+                optimizer, scheduler, scaler,
+                args.device, args.amp,
+                freeze_backbone=args.freeze_backbone,
+            )
+            val_loss, val_metric = evaluate(model, val_loader, criterion, args.device)
 
-        val_accuracies.append(val_acc)
+        val_metrics.append(val_metric)
 
-        # Track milestone accuracies
+        # Track milestone values
         if epoch in [5, 10, 20]:
-            milestone_accs[f"val/acc_at_epoch_{epoch}"] = val_acc
+            milestone_key = f"val/{metric_name.lower()}_at_epoch_{epoch}"
+            milestone_vals[milestone_key] = val_metric
 
         # Log metrics
         metrics = {
             "train/loss": train_loss,
-            "train/acc": train_acc,
             "val/loss": val_loss,
-            "val/acc": val_acc,
+            f"val/{metric_name.lower()}": val_metric,
             "train/lr": optimizer.param_groups[0]["lr"],
             "epoch": epoch,
         }
+        if train_metric is not None:
+            metrics[f"train/{metric_name.lower()}"] = train_metric
 
         if not args.no_wandb:
             wandb.log(metrics, step=epoch)
 
         # Print epoch summary
+        train_str = f"Loss: {train_loss:.4f}" if train_metric is None else f"{metric_name}: {train_metric:.2f}%"
         print(f"Epoch {epoch}/{args.epochs} | "
-              f"Train: {train_acc:.2f}% | "
-              f"Val: {val_acc:.2f}% | "
-              f"Best: {max(best_acc, val_acc):.2f}%")
+              f"Train {train_str} | "
+              f"Val {metric_name}: {val_metric:.2f}% | "
+              f"Best: {max(best_metric, val_metric):.2f}%")
 
         # Track best
-        if val_acc > best_acc:
-            best_acc = val_acc
+        if val_metric > best_metric:
+            best_metric = val_metric
 
     # Compute AULC
-    aulc = compute_aulc(val_accuracies)
+    aulc = compute_aulc(val_metrics)
 
     # Log final metrics
     final_metrics = {
-        "val/best_acc": best_acc,
-        "val/final_acc": val_accuracies[-1],
-        "val/aulc": aulc,
-        **milestone_accs,
+        f"val/best_{metric_name.lower()}": best_metric,
+        f"val/final_{metric_name.lower()}": val_metrics[-1],
+        f"val/aulc_{metric_name.lower()}": aulc,
+        **milestone_vals,
     }
 
     if not args.no_wandb:
@@ -366,10 +456,10 @@ def main():
 
     print("\n" + "=" * 60)
     print("Training complete!")
-    print(f"Best accuracy: {best_acc:.2f}%")
-    print(f"Final accuracy: {val_accuracies[-1]:.2f}%")
-    print(f"AULC: {aulc:.2f}")
-    for key, value in milestone_accs.items():
+    print(f"Best {metric_name}: {best_metric:.2f}%")
+    print(f"Final {metric_name}: {val_metrics[-1]:.2f}%")
+    print(f"AULC ({metric_name}): {aulc:.2f}")
+    for key, value in milestone_vals.items():
         print(f"{key}: {value:.2f}%")
     print("=" * 60)
 
@@ -388,7 +478,7 @@ def main():
         f"results_{args.dataset}_{init_label}{suffix}_frac{args.label_fraction}_s{args.seed}.csv"
     )
     import pandas as pd
-    results_df = pd.DataFrame([{
+    results_row = {
         "dataset": args.dataset,
         "init": args.init,
         "label_fraction": args.label_fraction,
@@ -396,11 +486,27 @@ def main():
         "keep_projector": args.keep_projector,
         "train_projector": args.train_projector,
         "freeze_backbone": args.freeze_backbone,
-        "best_acc": best_acc,
-        "final_acc": val_accuracies[-1],
-        "aulc": aulc,
-        **milestone_accs,
-    }])
+    }
+    if multilabel:
+        results_row.update({
+            "best_mAP": best_metric,
+            "final_mAP": val_metrics[-1],
+            "aulc_mAP": aulc,
+            "best_acc": None,
+            "final_acc": None,
+            "aulc": None,
+        })
+    else:
+        results_row.update({
+            "best_acc": best_metric,
+            "final_acc": val_metrics[-1],
+            "aulc": aulc,
+            "best_mAP": None,
+            "final_mAP": None,
+            "aulc_mAP": None,
+        })
+    results_row.update(milestone_vals)
+    results_df = pd.DataFrame([results_row])
     results_df.to_csv(results_path, index=False)
     print(f"Results saved to {results_path}")
 

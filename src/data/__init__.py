@@ -1,2 +1,2 @@
 from .distill_datasets import get_distill_dataloader
-from .downstream_datasets import get_downstream_dataloaders
+from .downstream_datasets import get_downstream_dataloaders, is_multilabel_dataset

@@ -12,6 +12,7 @@ from torchvision.datasets import (
     DTD,
     EuroSAT,
     ImageFolder,
+    VOCDetection,
 )
 from sklearn.model_selection import train_test_split
 import numpy as np
@@ -43,6 +44,42 @@ def get_val_transform():
     ])
 
 
+VOC_CLASSES = [
+    'aeroplane', 'bicycle', 'bird', 'boat', 'bottle',
+    'bus', 'car', 'cat', 'chair', 'cow',
+    'diningtable', 'dog', 'horse', 'motorbike', 'person',
+    'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'
+]
+
+
+class VOCMultiLabel(torch.utils.data.Dataset):
+    """Pascal VOC 2007 as multi-label classification."""
+
+    def __init__(self, root, image_set="trainval", download=False, transform=None):
+        self.voc = VOCDetection(
+            root=root, year="2007", image_set=image_set, download=download
+        )
+        self.transform = transform
+        self.class_to_idx = {c: i for i, c in enumerate(VOC_CLASSES)}
+
+    def __len__(self):
+        return len(self.voc)
+
+    def __getitem__(self, index):
+        img, target = self.voc[index]
+        label = torch.zeros(len(VOC_CLASSES), dtype=torch.float32)
+        objects = target["annotation"].get("object", [])
+        if not isinstance(objects, list):
+            objects = [objects]
+        for obj in objects:
+            name = obj["name"]
+            if name in self.class_to_idx:
+                label[self.class_to_idx[name]] = 1.0
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
 # Dataset configurations
 DATASET_INFO = {
     "pets": {
@@ -50,30 +87,42 @@ DATASET_INFO = {
         "num_classes": 37,
         "train_split": "trainval",
         "test_split": "test",
+        "multilabel": False,
     },
     "flowers102": {
         "class": Flowers102,
         "num_classes": 102,
         "train_split": "train",
         "test_split": "test",
+        "multilabel": False,
     },
     "dtd": {
         "class": DTD,
         "num_classes": 47,
         "train_split": "train",
         "test_split": "test",
+        "multilabel": False,
     },
     "eurosat": {
         "class": EuroSAT,
         "num_classes": 10,
         "train_split": None,  # Single split, need to create our own
         "test_split": None,
+        "multilabel": False,
     },
     "imagenette": {
         "class": None,  # Uses ImageFolder
         "num_classes": 10,
         "train_split": "train",
         "test_split": "val",
+        "multilabel": False,
+    },
+    "voc": {
+        "class": None,
+        "num_classes": 20,
+        "train_split": "trainval",
+        "test_split": "test",
+        "multilabel": True,
     },
 }
 
@@ -98,21 +147,34 @@ def get_labels_from_dataset(dataset) -> np.ndarray:
 def create_label_fraction_subset(
     dataset,
     label_fraction: float,
-    seed: int = 42
+    seed: int = 42,
+    multilabel: bool = False,
 ) -> Subset:
     """
-    Create a stratified subset of the dataset.
+    Create a subset of the dataset.
+
+    Uses stratified sampling for single-label datasets and random
+    subsampling for multi-label datasets (stratification is undefined
+    for multi-label).
 
     Args:
         dataset: Full dataset
         label_fraction: Fraction of data to use (0.01, 0.1, or 1.0)
         seed: Random seed for reproducibility
+        multilabel: If True, use random subsampling instead of stratified
 
     Returns:
         Subset of the dataset
     """
     if label_fraction >= 1.0:
         return dataset
+
+    if multilabel:
+        rng = np.random.RandomState(seed)
+        n = len(dataset)
+        n_subset = max(1, int(n * label_fraction))
+        indices = rng.choice(n, size=n_subset, replace=False)
+        return Subset(dataset, indices.tolist())
 
     labels = get_labels_from_dataset(dataset)
     indices = np.arange(len(dataset))
@@ -189,6 +251,13 @@ def load_dataset(
             transform=transform
         )
 
+    elif dataset_name == "voc":
+        image_set = "trainval" if split == "train" else "test"
+        return VOCMultiLabel(
+            root=data_root, image_set=image_set,
+            download=True, transform=transform,
+        )
+
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -235,9 +304,10 @@ def get_downstream_dataloaders(
     )
 
     # Apply label fraction subsampling to training data
+    is_multilabel = info.get("multilabel", False)
     if label_fraction < 1.0:
         train_dataset = create_label_fraction_subset(
-            train_dataset, label_fraction, seed
+            train_dataset, label_fraction, seed, multilabel=is_multilabel
         )
         print(f"Using {len(train_dataset)} training samples ({label_fraction*100:.0f}%)")
 
@@ -270,3 +340,10 @@ def get_num_classes(dataset_name: str) -> int:
     if dataset_name not in DATASET_INFO:
         raise ValueError(f"Unknown dataset: {dataset_name}")
     return DATASET_INFO[dataset_name]["num_classes"]
+
+
+def is_multilabel_dataset(dataset_name: str) -> bool:
+    """Check if a dataset uses multi-label classification."""
+    if dataset_name not in DATASET_INFO:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    return DATASET_INFO[dataset_name].get("multilabel", False)
