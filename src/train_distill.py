@@ -23,6 +23,7 @@ from src.losses.distillation import (
     embedding_loss,
     relational_loss,
     combined_loss,
+    cka_combined_loss,
     compute_similarity_metrics,
 )
 from src.losses.validation_metrics import (
@@ -75,10 +76,12 @@ def parse_args():
 
     # Loss
     parser.add_argument("--loss", type=str, default="combined",
-                        choices=["embedding", "combined"],
+                        choices=["embedding", "combined", "cka_combined"],
                         help="Loss function")
     parser.add_argument("--lambda_rel", type=float, default=0.5,
                         help="Weight for relational loss")
+    parser.add_argument("--lambda_cka", type=float, default=0.5,
+                        help="Weight for CKA loss (used with cka_combined)")
 
     # System
     parser.add_argument("--num_workers", type=int, default=8,
@@ -162,6 +165,7 @@ def train_epoch(
     total_loss = 0
     total_emb_loss = 0
     total_rel_loss = 0
+    total_cka_loss = 0
     total_cos_sim = 0
     num_batches = 0
 
@@ -179,15 +183,26 @@ def train_epoch(
         if args.amp:
             with autocast():
                 student_emb = student(images, normalize=True)
-                if args.loss == "embedding":
-                    loss = embedding_loss(student_emb, teacher_emb)
-                    loss_dict = {"embedding_loss": loss.item(), "total_loss": loss.item()}
-                else:
-                    loss, loss_dict = combined_loss(
-                        student_emb, teacher_emb, args.lambda_rel
-                    )
+
+            # Compute loss in float32 outside autocast for numerical stability.
+            # CKA's backward through sqrt/division can overflow under AMP scaling.
+            student_emb_f32 = student_emb.float()
+            teacher_emb_f32 = teacher_emb.float()
+            if args.loss == "embedding":
+                loss = embedding_loss(student_emb_f32, teacher_emb_f32)
+                loss_dict = {"embedding_loss": loss.item(), "total_loss": loss.item()}
+            elif args.loss == "cka_combined":
+                loss, loss_dict = cka_combined_loss(
+                    student_emb_f32, teacher_emb_f32, args.lambda_cka
+                )
+            else:  # combined (relational)
+                loss, loss_dict = combined_loss(
+                    student_emb_f32, teacher_emb_f32, args.lambda_rel
+                )
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -195,12 +210,17 @@ def train_epoch(
             if args.loss == "embedding":
                 loss = embedding_loss(student_emb, teacher_emb)
                 loss_dict = {"embedding_loss": loss.item(), "total_loss": loss.item()}
-            else:
+            elif args.loss == "cka_combined":
+                loss, loss_dict = cka_combined_loss(
+                    student_emb, teacher_emb, args.lambda_cka
+                )
+            else:  # combined (relational)
                 loss, loss_dict = combined_loss(
                     student_emb, teacher_emb, args.lambda_rel
                 )
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
             optimizer.step()
 
         scheduler.step()
@@ -213,6 +233,7 @@ def train_epoch(
         total_loss += loss_dict["total_loss"]
         total_emb_loss += loss_dict.get("embedding_loss", 0)
         total_rel_loss += loss_dict.get("relational_loss", 0)
+        total_cka_loss += loss_dict.get("cka_loss", 0)
         total_cos_sim += metrics["cosine_sim_mean"]
         num_batches += 1
 
@@ -228,6 +249,8 @@ def train_epoch(
         "train/loss": total_loss / num_batches,
         "train/embedding_loss": total_emb_loss / num_batches,
         "train/relational_loss": total_rel_loss / num_batches,
+        "train/cka_loss": total_cka_loss / num_batches,
+        "train/cka_value": 1.0 - (total_cka_loss / num_batches) if total_cka_loss > 0 else 0,
         "train/cosine_sim_mean": total_cos_sim / num_batches,
         "train/lr": scheduler.get_last_lr()[0],
     }
@@ -280,6 +303,8 @@ def main():
     print(f"Learning rate: {args.lr}")
     print(f"Device: {args.device}")
     print(f"Validation fraction: {args.val_fraction}")
+    if args.loss == "cka_combined":
+        print(f"Lambda CKA: {args.lambda_cka}")
     print("=" * 60)
 
     # Load teacher
@@ -401,6 +426,7 @@ def main():
             print(f"  Val cosine: {val_cos:.4f} (train-val gap: {gap:.4f})")
             print(f"  Val R@1: {metrics['val/retrieval_R@1']:.4f}, R@5: {metrics['val/retrieval_R@5']:.4f}")
             print(f"  Val RSA corr: {metrics['val/rsa_correlation']:.4f}")
+            print(f"  Val CKA (proj): {metrics['val/cka_projected']:.4f}, CKA (backbone): {metrics['val/cka_backbone']:.4f}")
             print(f"  Backbone eff. rank: {metrics['val/backbone_collapse_effective_rank']:.1f}")
 
         # Run linear probe periodically
@@ -429,9 +455,13 @@ def main():
         val_cos_sim = metrics.get("val/cosine_mean", metrics["train/cosine_sim_mean"])
         if val_cos_sim > best_val_cos_sim:
             best_val_cos_sim = val_cos_sim
+            if args.loss == "cka_combined":
+                ckpt_name = f"{args.dataset}_{args.teacher}_cka_l{args.lambda_cka}_distilled_best.pth"
+            else:
+                ckpt_name = f"{args.dataset}_{args.teacher}_distilled_best.pth"
             save_checkpoint(
                 student, optimizer, scheduler, epoch, args,
-                f"{args.dataset}_{args.teacher}_distilled_best.pth"
+                ckpt_name
             )
 
         # Track best training cosine sim
@@ -440,15 +470,23 @@ def main():
 
         # Save periodic checkpoints
         if epoch % args.save_every == 0:
+            if args.loss == "cka_combined":
+                periodic_name = f"{args.dataset}_{args.teacher}_cka_l{args.lambda_cka}_distilled_epoch{epoch}.pth"
+            else:
+                periodic_name = f"{args.dataset}_{args.teacher}_distilled_epoch{epoch}.pth"
             save_checkpoint(
                 student, optimizer, scheduler, epoch, args,
-                f"{args.dataset}_{args.teacher}_distilled_epoch{epoch}.pth"
+                periodic_name
             )
 
     # Save final checkpoint
+    if args.loss == "cka_combined":
+        final_name = f"{args.dataset}_{args.teacher}_cka_l{args.lambda_cka}_distilled_final.pth"
+    else:
+        final_name = f"{args.dataset}_{args.teacher}_distilled_final.pth"
     save_checkpoint(
         student, optimizer, scheduler, args.epochs, args,
-        f"{args.dataset}_{args.teacher}_distilled_final.pth"
+        final_name
     )
 
     print("\n" + "=" * 60)

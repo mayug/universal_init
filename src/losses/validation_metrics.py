@@ -339,6 +339,11 @@ def validate_distillation(
     # 5. Collapse stats (on backbone embeddings - what we actually keep)
     metrics.update({f"val/backbone_{k}": v for k, v in compute_collapse_stats(backbone_emb).items()})
 
+    # 6. CKA metrics (projected and backbone vs teacher)
+    from src.analysis.cka import linear_cka
+    metrics["val/cka_projected"] = linear_cka(student_emb.cpu(), teacher_emb.cpu())
+    metrics["val/cka_backbone"] = linear_cka(backbone_emb.cpu(), teacher_emb.cpu())
+
     return metrics
 
 

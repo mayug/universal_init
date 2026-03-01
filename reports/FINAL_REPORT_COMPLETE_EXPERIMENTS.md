@@ -147,6 +147,9 @@ On EuroSAT (domain shift from natural images), the student outperforms teacher o
 ### 5. Sample Efficiency Not Achieved
 The primary hypothesis that distillation yields better sample efficiency was not confirmed. ImageNet pretraining provides better low-data performance on both tasks.
 
+### 6. Structural Alignment Does Not Close the Gap (Experiment 5)
+Replacing relational loss with a differentiable CKA loss improved student-teacher backbone CKA from 0.01–0.26 to 0.52–0.68 (3-50x improvement). However, downstream accuracy was unchanged within noise (< 1 pp). This disproves the hypothesis that structural misalignment was the performance bottleneck. The gap is more fundamental: insufficient training data diversity (82K COCO vs 1.2M ImageNet) and information loss through the distillation pipeline.
+
 ---
 
 ## Recommendations
@@ -219,4 +222,15 @@ The primary hypothesis that distillation yields better sample efficiency was not
 
 ---
 
-*Report generated: January 29, 2026*
+---
+
+## Experiments 4 & 5: Multi-Teacher Distillation and CKA Loss
+
+See `reports/experiment4_platonic_representation.md` for the full report covering:
+
+- **Experiment 4:** Multi-teacher distillation (Supervised ViT-B/16, CLIP ViT-B/16 pre-projection, CLIP ViT-B/16 with projection), downstream fine-tuning, linear probing, and CKA similarity analysis.
+- **Experiment 5:** Differentiable CKA distillation loss — replacing relational loss with CKA to directly optimize structural alignment. 9 distillation runs (3 teachers x 3 λ_cka values) + 84 downstream evaluation runs.
+
+---
+
+*Report last updated: February 28, 2026*

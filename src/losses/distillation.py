@@ -72,6 +72,77 @@ def combined_loss(
     return total_loss, loss_dict
 
 
+def cka_loss(student_emb: torch.Tensor, teacher_emb: torch.Tensor) -> torch.Tensor:
+    """Differentiable linear CKA loss: 1 - CKA(student, teacher).
+
+    Unlike the analysis version in src/analysis/cka.py, this stays in the
+    computational graph for backpropagation. Both inputs should be in the
+    same embedding space (after projection).
+
+    Computation is forced to float32 for numerical stability under AMP,
+    since the Frobenius-norm products in CKA lose precision in float16.
+
+    Args:
+        student_emb: Student embeddings [B, D] (L2-normalized)
+        teacher_emb: Teacher embeddings [B, D] (L2-normalized)
+    Returns:
+        loss: 1 - CKA, in [0, 1]. Lower = better structural alignment.
+    """
+    # Force float32 for numerical stability (critical under AMP)
+    X = student_emb.float()
+    Y = teacher_emb.float()
+
+    # Center features (removes mean, required for linear CKA)
+    X = X - X.mean(dim=0, keepdim=True)
+    Y = Y - Y.mean(dim=0, keepdim=True)
+
+    # CKA = ||Y^T X||_F^2 / (||X^T X||_F * ||Y^T Y||_F)
+    YtX = Y.T @ X
+    XtX = X.T @ X
+    YtY = Y.T @ Y
+
+    numerator = (YtX * YtX).sum()
+    # Epsilon inside sqrt to avoid infinite gradient of sqrt(0)
+    denominator = torch.sqrt((XtX * XtX).sum() * (YtY * YtY).sum() + 1e-12)
+
+    cka = numerator / denominator
+    # Clamp to [0, 1] for safety (float rounding can push slightly above 1)
+    cka = cka.clamp(0.0, 1.0)
+    return 1.0 - cka
+
+
+def cka_combined_loss(
+    student_emb: torch.Tensor,
+    teacher_emb: torch.Tensor,
+    lambda_cka: float = 0.5
+) -> tuple[torch.Tensor, dict]:
+    """Combined cosine embedding loss + CKA structural loss.
+
+    Replaces relational_loss with CKA for better structural alignment.
+
+    Args:
+        student_emb: L2-normalized student embeddings [B, D]
+        teacher_emb: L2-normalized teacher embeddings [B, D]
+        lambda_cka: Weight for CKA loss component
+
+    Returns:
+        total_loss: Combined loss value
+        loss_dict: Dictionary with individual loss components for logging
+    """
+    emb_loss = embedding_loss(student_emb, teacher_emb)
+    c_loss = cka_loss(student_emb, teacher_emb)
+
+    total_loss = emb_loss + lambda_cka * c_loss
+
+    loss_dict = {
+        "embedding_loss": emb_loss.item(),
+        "cka_loss": c_loss.item(),
+        "cka_value": 1.0 - c_loss.item(),  # actual CKA score for logging
+        "total_loss": total_loss.item(),
+    }
+    return total_loss, loss_dict
+
+
 def compute_similarity_metrics(
     student_emb: torch.Tensor,
     teacher_emb: torch.Tensor
