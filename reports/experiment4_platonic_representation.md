@@ -750,11 +750,111 @@ On Pets and EuroSAT, results were mixed — no teacher consistently won, weakeni
 
 ---
 
+## Phase 2: VOC Label Fraction Experiments (1%, 10%)
+
+**Date:** March 2, 2026
+
+The 100%-label results showed CLIP's +12.4 mAP linear probe advantage over supervised. The original platonic hypothesis predicts this advantage should be *largest* in low-data regimes (better sample efficiency). Testing 1% (~50 images) and 10% (~501 images) label fractions.
+
+**32 runs:** 2 fractions × (2 baselines + 3 non-CKA + 3 CKA λ=0.1) × 2 modes (fine-tune + lin probe).
+
+### Linear Probe Results (Best mAP %)
+
+| Init | 1% (~50 imgs) | 10% (~501 imgs) | 100% (5,011 imgs) |
+|------|---------------|-----------------|---------------------|
+| Random | 8.1 | 8.1 | 9.0 |
+| **ImageNet** | **40.8** | **78.8** | **85.2** |
+| Supervised (no CKA) | 21.1 | 41.4 | 51.4 |
+| Supervised (CKA λ=0.1) | 19.8 | 42.4 | 52.2 |
+| **CLIP-768 (no CKA)** | **38.4** | **57.6** | **63.8** |
+| CLIP-768 (CKA λ=0.1) | 37.1 | 56.5 | 63.8 |
+| CLIP-512 (no CKA) | 33.8 | 54.6 | 61.2 |
+| CLIP-512 (CKA λ=0.1) | 31.9 | 55.2 | 62.6 |
+
+### Fine-tune Results (Best mAP %)
+
+| Init | 1% (~50 imgs) | 10% (~501 imgs) | 100% (5,011 imgs) |
+|------|---------------|-----------------|---------------------|
+| Random | 8.7 | 11.1 | 24.9 |
+| **ImageNet** | 13.1 | **60.1** | **87.4** |
+| **Supervised (no CKA)** | **18.0** | 54.4 | **67.3** |
+| Supervised (CKA λ=0.1) | 16.5 | **54.6** | 66.7 |
+| CLIP-768 (no CKA) | 16.7 | 53.7 | 66.9 |
+| CLIP-768 (CKA λ=0.1) | 18.3 | 50.5 | 66.3 |
+| CLIP-512 (no CKA) | 14.8 | 48.6 | 63.9 |
+| CLIP-512 (CKA λ=0.1) | 14.8 | 49.1 | 64.1 |
+
+### Key Findings
+
+#### 1. CLIP's linear probe advantage grows in low-data regimes
+
+| Label Fraction | CLIP-768 LP | Supervised LP | Gap |
+|---------------|-------------|---------------|-----|
+| 1% (~50 imgs) | 38.4 | 21.1 | **+17.3** |
+| 10% (~501 imgs) | 57.6 | 41.4 | **+16.2** |
+| 100% (5,011 imgs) | 63.8 | 51.4 | +12.4 |
+
+The gap **increases from +12.4 to +17.3 mAP** as data decreases — exactly the sample efficiency prediction of the platonic hypothesis. CLIP-distilled features require fewer labeled examples to achieve strong performance on VOC, confirming that they encode more immediately useful object-level structure.
+
+#### 2. At 1%, CLIP-768 nearly matches ImageNet on linear probing
+
+| Init | 1% Lin Probe mAP |
+|------|-------------------|
+| ImageNet | 40.8 |
+| CLIP-768 (no CKA) | **38.4** |
+| CLIP-768 (CKA λ=0.1) | 37.1 |
+| Supervised (no CKA) | 21.1 |
+
+CLIP-768 reaches **94% of ImageNet's performance** with only 50 labeled images (38.4 vs 40.8, gap of just 2.4 mAP). This is remarkable — the distilled CLIP student nearly matches a model pretrained on 1.2M labeled ImageNet images. By contrast, supervised distillation achieves only 52% of ImageNet (21.1 vs 40.8).
+
+At 10% and 100%, ImageNet pulls ahead substantially (78.8 → 85.2 vs 57.6 → 63.8), showing that the advantage is specific to the extreme low-data regime.
+
+#### 3. Fine-tuning at 1% inverts the ImageNet advantage
+
+| Init | 1% Fine-tune mAP |
+|------|-------------------|
+| Supervised (no CKA) | **18.0** |
+| CLIP-768 (CKA λ=0.1) | 18.3 |
+| CLIP-768 (no CKA) | 16.7 |
+| CLIP-512 (no CKA) | 14.8 |
+| **ImageNet** | **13.1** |
+| Random | 8.7 |
+
+ImageNet fine-tuning (13.1 mAP) actually *underperforms* all distilled initializations at 1%. With only ~50 images and 50 epochs of full fine-tuning, ImageNet's large feature space overfits badly. Distilled models, with simpler learned features, provide better inductive bias for few-shot fine-tuning. By 10%, ImageNet recovers its dominance (60.1 vs 54.6 best distilled).
+
+#### 4. Linear probing >> fine-tuning in extreme low-data for pretrained models
+
+| Init | 1% Lin Probe | 1% Fine-tune | LP advantage |
+|------|-------------|-------------|--------------|
+| ImageNet | 40.8 | 13.1 | **+27.7** |
+| CLIP-768 | 38.4 | 16.7 | **+21.7** |
+| Supervised | 21.1 | 18.0 | +3.1 |
+| Random | 8.1 | 8.7 | -0.6 |
+
+With ~50 training images, freezing the backbone and training only a linear head dramatically outperforms full fine-tuning for models with good pretrained features. ImageNet gains +27.7 mAP from linear probing vs fine-tuning; CLIP-768 gains +21.7. This confirms that with few labels, preserving learned representations is far more important than adaptation flexibility.
+
+#### 5. CKA λ=0.1 provides no consistent benefit at low data either
+
+CKA-distilled and non-CKA-distilled results are within noise at all fractions. The structural alignment improvement from CKA loss does not translate to better sample efficiency.
+
+---
+
+### Summary: The Sample Efficiency Story
+
+The VOC label fraction results provide the strongest evidence yet for the platonic hypothesis — but with important nuance:
+
+1. **CLIP features are genuinely more sample-efficient** on domain-aligned tasks (VOC). The linear probe gap grows from +12.4 at 100% to +17.3 at 1%.
+2. **This advantage is specific to linear probing** (frozen features). Fine-tuning erases or inverts the advantage.
+3. **CLIP distillation approaches ImageNet quality at 1%** (38.4 vs 40.8 mAP) — a surprising result given the 20+ mAP gap at 100%.
+4. **The platonic hypothesis is conditionally supported**: CLIP-distilled features transfer more efficiently than supervised-distilled features *when* the downstream task aligns with CLIP's pretraining domain *and* the backbone is frozen.
+
+---
+
 ## Implementation Notes
 
 - **Modified:** `src/data/downstream_datasets.py` (added `VOCMultiLabel` class, multi-label support), `src/data/__init__.py` (exports), `src/train_downstream.py` (multi-label training/eval loops, mAP metric, BCEWithLogitsLoss)
-- **Scripts:** `scripts/voc_downstream.sh` (28 runs)
-- **Runtime:** ~2h total (28 runs × ~4min each, sequential)
+- **Scripts:** `scripts/voc_downstream.sh` (28 runs at 100%), `scripts/voc_label_fractions.sh` (32 runs at 1% and 10%)
+- **Runtime:** ~2h (100% runs) + ~2h (label fraction runs) = ~4h total
 - **Hardware:** Single GPU
 - **Data:** Pascal VOC 2007 (trainval: 5,011 images, test: 4,952 images, 20 classes)
 
