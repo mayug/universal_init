@@ -20,17 +20,22 @@ class GenericTeacher(nn.Module):
                   If True, keep native head (e.g. CLIP projection layer).
     """
 
-    def __init__(self, model_name: str, device: str = "cuda", use_head: bool = False):
+    def __init__(self, model_name: str, device: str = "cuda", use_head: bool = False,
+                 img_size: int = None):
         super().__init__()
         self.model_name = model_name
         self.device = device
         self.use_head = use_head
+        self.img_size = img_size
 
         # Create model: num_classes=0 strips the head
-        if use_head:
-            self.model = timm.create_model(model_name, pretrained=True)
-        else:
-            self.model = timm.create_model(model_name, pretrained=True, num_classes=0)
+        # img_size overrides native resolution (e.g. DINOv2-L 518→224 via pos-embed interpolation)
+        create_kwargs = {"pretrained": True}
+        if not use_head:
+            create_kwargs["num_classes"] = 0
+        if img_size is not None:
+            create_kwargs["img_size"] = img_size
+        self.model = timm.create_model(model_name, **create_kwargs)
 
         self.model = self.model.to(device)
         self.model.eval()
@@ -47,12 +52,16 @@ class GenericTeacher(nn.Module):
 
         print(f"GenericTeacher: {model_name}")
         print(f"  use_head={use_head}, embed_dim={self.embed_dim}")
+        if img_size is not None:
+            print(f"  img_size override: {img_size}px (native: {self.model.pretrained_cfg.get('input_size', 'unknown')})")
         print(f"  mean={self._data_config['mean']}, std={self._data_config['std']}")
 
     @torch.no_grad()
     def _detect_embed_dim(self) -> int:
         """Detect output embedding dimension via dummy forward pass."""
-        dummy = torch.randn(1, 3, 224, 224, device=self.device)
+        # Use img_size if overridden, otherwise use the model's native input size
+        sz = self.img_size or 224
+        dummy = torch.randn(1, 3, sz, sz, device=self.device)
         out = self.model(dummy)
         if out.dim() == 1:
             return out.shape[0]

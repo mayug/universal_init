@@ -23,6 +23,7 @@ from src.losses.distillation import (
     embedding_loss,
     relational_loss,
     combined_loss,
+    cka_loss,
     cka_combined_loss,
     compute_similarity_metrics,
 )
@@ -34,9 +35,14 @@ from src.losses.validation_metrics import (
 
 TEACHER_CONFIGS = {
     "imagebind":   {"class": "ImageBindTeacher"},
+    # ViT-B teachers (768-dim)
     "supervised":  {"model": "vit_base_patch16_224.augreg_in1k",   "use_head": False},  # 768-dim
     "clip_768":    {"model": "vit_base_patch16_clip_224.openai",    "use_head": False},  # 768-dim
     "clip_512":    {"model": "vit_base_patch16_clip_224.openai",    "use_head": True},   # 512-dim
+    # ViT-L teachers (1024-dim)
+    "supervised_l": {"model": "vit_large_patch16_224.augreg_in21k_ft_in1k", "use_head": False},  # 1024-dim
+    "clip_l":       {"model": "vit_large_patch14_clip_224.openai",           "use_head": False},  # 1024-dim
+    "dinov2_l":     {"model": "vit_large_patch14_dinov2.lvd142m",            "use_head": False, "img_size": 224},  # 1024-dim (native 518px)
 }
 
 
@@ -76,7 +82,7 @@ def parse_args():
 
     # Loss
     parser.add_argument("--loss", type=str, default="combined",
-                        choices=["embedding", "combined", "cka_combined"],
+                        choices=["embedding", "combined", "cka_combined", "cka_only"],
                         help="Loss function")
     parser.add_argument("--lambda_rel", type=float, default=0.5,
                         help="Weight for relational loss")
@@ -191,6 +197,9 @@ def train_epoch(
             if args.loss == "embedding":
                 loss = embedding_loss(student_emb_f32, teacher_emb_f32)
                 loss_dict = {"embedding_loss": loss.item(), "total_loss": loss.item()}
+            elif args.loss == "cka_only":
+                loss = cka_loss(student_emb_f32, teacher_emb_f32)
+                loss_dict = {"cka_loss": loss.item(), "total_loss": loss.item()}
             elif args.loss == "cka_combined":
                 loss, loss_dict = cka_combined_loss(
                     student_emb_f32, teacher_emb_f32, args.lambda_cka
@@ -210,6 +219,9 @@ def train_epoch(
             if args.loss == "embedding":
                 loss = embedding_loss(student_emb, teacher_emb)
                 loss_dict = {"embedding_loss": loss.item(), "total_loss": loss.item()}
+            elif args.loss == "cka_only":
+                loss = cka_loss(student_emb, teacher_emb)
+                loss_dict = {"cka_loss": loss.item(), "total_loss": loss.item()}
             elif args.loss == "cka_combined":
                 loss, loss_dict = cka_combined_loss(
                     student_emb, teacher_emb, args.lambda_cka
@@ -305,6 +317,8 @@ def main():
     print(f"Validation fraction: {args.val_fraction}")
     if args.loss == "cka_combined":
         print(f"Lambda CKA: {args.lambda_cka}")
+    if args.loss == "cka_only":
+        print("CKA-only mode: no point-wise cosine loss, structural alignment only")
     print("=" * 60)
 
     # Load teacher
@@ -319,6 +333,7 @@ def main():
             model_name=config["model"],
             device=args.device,
             use_head=config.get("use_head", False),
+            img_size=config.get("img_size", None),
         )
     print(f"Teacher loaded. Embedding dim: {teacher.embed_dim}")
 
@@ -451,11 +466,17 @@ def main():
         print(f"  Train Loss: {metrics['train/loss']:.4f}")
         print(f"  Train Cosine sim: {metrics['train/cosine_sim_mean']:.4f}")
 
-        # Save best model based on validation cosine similarity
-        val_cos_sim = metrics.get("val/cosine_mean", metrics["train/cosine_sim_mean"])
+        # Save best model based on validation metric
+        # For CKA-only: use CKA (structural alignment) instead of cosine similarity
+        if args.loss == "cka_only":
+            val_cos_sim = metrics.get("val/cka_projected", 1.0 - metrics.get("train/cka_loss", 1.0))
+        else:
+            val_cos_sim = metrics.get("val/cosine_mean", metrics["train/cosine_sim_mean"])
         if val_cos_sim > best_val_cos_sim:
             best_val_cos_sim = val_cos_sim
-            if args.loss == "cka_combined":
+            if args.loss == "cka_only":
+                ckpt_name = f"{args.dataset}_{args.teacher}_cka_only_distilled_best.pth"
+            elif args.loss == "cka_combined":
                 ckpt_name = f"{args.dataset}_{args.teacher}_cka_l{args.lambda_cka}_distilled_best.pth"
             else:
                 ckpt_name = f"{args.dataset}_{args.teacher}_distilled_best.pth"
@@ -470,7 +491,9 @@ def main():
 
         # Save periodic checkpoints
         if epoch % args.save_every == 0:
-            if args.loss == "cka_combined":
+            if args.loss == "cka_only":
+                periodic_name = f"{args.dataset}_{args.teacher}_cka_only_distilled_epoch{epoch}.pth"
+            elif args.loss == "cka_combined":
                 periodic_name = f"{args.dataset}_{args.teacher}_cka_l{args.lambda_cka}_distilled_epoch{epoch}.pth"
             else:
                 periodic_name = f"{args.dataset}_{args.teacher}_distilled_epoch{epoch}.pth"
@@ -480,7 +503,9 @@ def main():
             )
 
     # Save final checkpoint
-    if args.loss == "cka_combined":
+    if args.loss == "cka_only":
+        final_name = f"{args.dataset}_{args.teacher}_cka_only_distilled_final.pth"
+    elif args.loss == "cka_combined":
         final_name = f"{args.dataset}_{args.teacher}_cka_l{args.lambda_cka}_distilled_final.pth"
     else:
         final_name = f"{args.dataset}_{args.teacher}_distilled_final.pth"
