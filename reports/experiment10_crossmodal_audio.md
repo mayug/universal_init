@@ -84,6 +84,23 @@ At 1% labels (most relevant for sample efficiency):
 
 3. **SBERT's semantic clustering helps audio.** ESC-50 categories are defined semantically ("dog bark", "rain", "clock tick"). SBERT naturally clusters semantically related text, and this clustering transfers well to audio: sounds that have similar text descriptions end up with similar embeddings. CLIP's clustering is instead optimized for visual discrimination.
 
+### Root Cause: CLIP's Caption Embeddings Are Clustered in a Narrow Cone
+
+To understand the 40pp gap, we measured the pairwise cosine similarity of 500 AudioCaps caption embeddings under each teacher:
+
+| Metric | CLIP text | SBERT |
+|--------|-----------|-------|
+| Mean pairwise cosine sim | **0.673** | 0.248 |
+| Std of pairwise sim | 0.089 | **0.145** |
+| Per-dim embedding variance | 0.000426 | **0.000979** (2.3x) |
+| Effective rank | 322 / 768 | 273 / 768 |
+
+CLIP maps all AudioCaps captions — "a dog barking while wind blows," "someone playing piano," "water flowing and birds chirping" — into a narrow cone (0.67 mean pairwise similarity). These are all "everyday scene descriptions" and CLIP's text encoder, trained to match images, doesn't differentiate them strongly. The student achieves 0.86 cosine similarity by learning to project all audio to roughly the same point — high alignment, zero discriminative power.
+
+SBERT spreads captions by semantic content (0.25 mean pairwise similarity, 1.6x higher spread), so "dog barking" is far from "piano playing." The student must learn genuinely different representations for different sounds, producing features that transfer to classification.
+
+**The signal-to-noise problem:** With 0.000426 per-dimension variance in CLIP embeddings, the discriminative information lives in tiny perturbations around a shared direction. The student operates in a low-SNR regime and cannot reliably extract this signal. SBERT's 2.3x higher variance gives the student a much stronger learning signal.
+
 ### Implications for the Platonic Representation Hypothesis
 
 The vision experiments (Exp 7-9) showed CLIP's geometry consistently outperformed supervised geometry for vision tasks, supporting the "platonic" / universal representation hypothesis. This audio experiment provides a **counterexample**: CLIP's text geometry is worse than SBERT's for audio, despite CLIP being "multimodal."
