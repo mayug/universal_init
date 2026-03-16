@@ -4,7 +4,7 @@
 
 We test whether text-based embedding geometry transfers cross-modally to audio — a modality the teacher has never seen. A MobileNetV3 audio student learns to match teacher text embeddings (from audio captions), then evaluates on ESC-50 environmental sound classification.
 
-**Key finding:** Sentence-BERT distillation massively outperforms CLIP text distillation (6/6 comparisons, avg +40pp), reversing the pattern seen in vision experiments where CLIP consistently dominates. This suggests CLIP's "platonic" geometry is vision-centric rather than truly universal.
+**Key finding:** Raw CLIP text distillation fails catastrophically for audio (avg -40pp vs SBERT), but **whitening CLIP embeddings completely fixes this** — whitened CLIP matches SBERT (3-3 win split, avg diff <1pp). The root cause is CLIP's "embedding cone" problem: AudioCaps captions cluster in a narrow cone (0.67 mean pairwise cosine sim) because CLIP treats them as similar visual scenes. Whitening (subtract mean, divide by std, re-normalize) spreads the embeddings and recovers the discriminative geometry underneath.
 
 ## Setup
 
@@ -26,15 +26,16 @@ We test whether text-based embedding geometry transfers cross-modally to audio �
 
 | Teacher | Val Cosine Similarity |
 |---------|----------------------|
-| CLIP text | **0.861** |
+| CLIP text (raw) | **0.861** |
+| CLIP text (whitened) | 0.423 |
 | Sentence-BERT | 0.724 |
 
-Note: Higher alignment to CLIP did NOT translate to better downstream features.
+Note: Higher alignment to raw CLIP did NOT translate to better downstream features. Whitened CLIP has lower alignment but much better geometry.
 
 ### Downstream Evaluation
 
 - **Dataset:** ESC-50 (50 environmental sound classes, 2000 clips, 5-fold CV)
-- **Conditions:** Random init (A), CLIP text distilled (B), AudioSet pretrained ceiling (C), Sentence-BERT distilled (E)
+- **Conditions:** Random init (A), CLIP text distilled (B), CLIP text whitened (D), AudioSet pretrained ceiling (C), Sentence-BERT distilled (E)
 - **Label fractions:** 100%, 10%, 1%
 - **Modes:** Fine-tune, Linear probe
 
@@ -45,14 +46,15 @@ Note: Higher alignment to CLIP did NOT translate to better downstream features.
 | Condition | 100% FT | 100% LP | 10% FT | 10% LP | 1% FT | 1% LP |
 |-----------|---------|---------|--------|--------|-------|-------|
 | A: Random | 70.2 | 13.4 | 13.8 | 5.2 | 8.2 | 3.8 |
-| B: CLIP text distilled | 75.0 | 4.2 | 19.5 | 3.4 | 8.1 | 9.3 |
-| E: SBERT distilled | **86.0** | **74.5** | **60.8** | **58.0** | **41.0** | **41.8** |
+| B: CLIP text (raw) | 75.0 | 4.2 | 19.5 | 3.4 | 8.1 | 9.3 |
+| D: CLIP text (whitened) | 83.9 | 75.6 | 57.9 | 56.6 | **43.6** | **43.6** |
+| E: SBERT distilled | **86.0** | 74.5 | **60.8** | **58.0** | 41.0 | 41.8 |
 | C: AudioSet pretrained | **96.9** | **89.2** | **73.8** | 54.7 | 34.8 | 30.3 |
 
-### Head-to-Head: CLIP vs Sentence-BERT
+### Head-to-Head: Raw CLIP vs Sentence-BERT
 
-| Setting | CLIP | SBERT | Winner | Delta |
-|---------|------|-------|--------|-------|
+| Setting | CLIP raw | SBERT | Winner | Delta |
+|---------|----------|-------|--------|-------|
 | 100% Fine-tune | 75.0 | 86.0 | SBERT | +11.0pp |
 | 100% Linear Probe | 4.2 | 74.5 | SBERT | +70.2pp |
 | 10% Fine-tune | 19.5 | 60.8 | SBERT | +41.3pp |
@@ -62,6 +64,32 @@ Note: Higher alignment to CLIP did NOT translate to better downstream features.
 
 **SBERT wins 6/6 comparisons**, average margin: **+40.4 percentage points**.
 
+### Head-to-Head: Whitened CLIP vs Sentence-BERT
+
+| Setting | CLIP-W | SBERT | Winner | Delta |
+|---------|--------|-------|--------|-------|
+| 100% Fine-tune | 83.9 | 86.0 | SBERT | +2.2pp |
+| 100% Linear Probe | 75.6 | 74.5 | CLIP-W | +1.1pp |
+| 10% Fine-tune | 57.9 | 60.8 | SBERT | +2.9pp |
+| 10% Linear Probe | 56.6 | 58.0 | SBERT | +1.5pp |
+| 1% Fine-tune | 43.6 | 41.0 | CLIP-W | +2.6pp |
+| 1% Linear Probe | 43.6 | 41.8 | CLIP-W | +1.8pp |
+
+**CLIP-W wins 3/6, SBERT wins 3/6** — essentially tied (avg diff: -0.2pp). Whitening completely closes the 40pp gap.
+
+### Impact of Whitening on CLIP
+
+| Setting | Raw CLIP | Whitened CLIP | Delta |
+|---------|----------|---------------|-------|
+| 100% Fine-tune | 75.0 | 83.9 | +8.9pp |
+| 100% Linear Probe | 4.2 | 75.6 | **+71.4pp** |
+| 10% Fine-tune | 19.5 | 57.9 | +38.4pp |
+| 10% Linear Probe | 3.4 | 56.6 | +53.2pp |
+| 1% Fine-tune | 8.1 | 43.6 | +35.5pp |
+| 1% Linear Probe | 9.3 | 43.6 | +34.3pp |
+
+Average improvement: **+40.3 percentage points**. Whitening transforms CLIP from useless to competitive.
+
 ### Gap Closure vs AudioSet Pretrained Ceiling
 
 At 1% labels (most relevant for sample efficiency):
@@ -69,58 +97,64 @@ At 1% labels (most relevant for sample efficiency):
 | Condition | Fine-tune | vs Ceiling (34.8%) | Linear Probe | vs Ceiling (30.3%) |
 |-----------|-----------|-------------------|--------------|-------------------|
 | Random | 8.2% | 0% closed | 3.8% | 0% closed |
-| CLIP distilled | 8.1% | 0% closed | 9.3% | 21% closed |
+| CLIP raw | 8.1% | 0% closed | 9.3% | 21% closed |
+| CLIP whitened | **43.6%** | **133% (exceeds ceiling)** | **43.6%** | **150% (exceeds ceiling)** |
 | SBERT distilled | **41.0%** | **123% (exceeds ceiling)** | **41.8%** | **143% (exceeds ceiling)** |
 
-**SBERT distillation exceeds AudioSet pretraining at 1% labels.** This is surprising: a text model that has never heard audio produces features that, at extreme low-data, outperform features from a model trained on 2M labeled audio clips.
+**Both whitened CLIP and SBERT distillation exceed AudioSet pretraining at 1% labels.** Text-based geometry — from models that have never heard audio — produces features that outperform 2M labeled audio clips when supervision is scarce.
 
 ## Analysis
 
-### Why Does SBERT Beat CLIP for Audio?
+### Why Does Raw CLIP Fail for Audio?
 
-1. **CLIP's geometry is vision-centric.** CLIP's text encoder is trained to match images. For a caption like "A dog barking while wind blows," CLIP's embedding reflects visual content (what a dog looks like, what wind looks like) rather than acoustic content. Sentence-BERT captures pure textual semantics — semantic similarity between "dog barking" and "animal sounds" — which maps more directly to audio category structure.
+The root cause is the **embedding cone problem**: CLIP's text encoder maps all AudioCaps captions into a narrow cone because they describe similar everyday scenes.
 
-2. **Higher distillation alignment ≠ better features.** CLIP achieved 0.861 cosine similarity (vs 0.724 for SBERT) during distillation, meaning the student more closely matched CLIP's geometry. Yet this geometry was less useful for audio classification. The student faithfully learned CLIP's vision-biased embedding structure, which is poorly suited for audio.
+| Metric | CLIP raw | CLIP whitened | SBERT |
+|--------|----------|---------------|-------|
+| Mean pairwise cosine sim | **0.663** | 0.001 | 0.256 |
+| Std of pairwise sim | 0.095 | 0.119 | **0.148** |
+| Per-dim embedding variance | 0.000426 | — | **0.000979** (2.3x) |
 
-3. **SBERT's semantic clustering helps audio.** ESC-50 categories are defined semantically ("dog bark", "rain", "clock tick"). SBERT naturally clusters semantically related text, and this clustering transfers well to audio: sounds that have similar text descriptions end up with similar embeddings. CLIP's clustering is instead optimized for visual discrimination.
+CLIP maps "a dog barking while wind blows," "someone playing piano," and "water flowing and birds chirping" into nearly the same embedding (0.66 mean pairwise cosine). The student achieves 0.86 alignment by learning to project all audio to roughly the same point — high alignment, zero discriminative power.
 
-### Root Cause: CLIP's Caption Embeddings Are Clustered in a Narrow Cone
+**The cone is domain-specific.** On COCO image captions, CLIP's mean pairwise cosine is only 0.36 — much more spread. The cone only appears for AudioCaps because CLIP's text encoder, trained to match images, treats all audio descriptions as "everyday scene descriptions" without strong differentiation.
 
-To understand the 40pp gap, we measured the pairwise cosine similarity of 500 AudioCaps caption embeddings under each teacher:
+### Why Does Whitening Fix It?
 
-| Metric | CLIP text | SBERT |
-|--------|-----------|-------|
-| Mean pairwise cosine sim | **0.673** | 0.248 |
-| Std of pairwise sim | 0.089 | **0.145** |
-| Per-dim embedding variance | 0.000426 | **0.000979** (2.3x) |
-| Effective rank | 322 / 768 | 273 / 768 |
+Whitening (subtract mean, divide by per-dimension std, re-normalize to unit sphere) transforms CLIP's narrow cone into a well-spread distribution:
 
-CLIP maps all AudioCaps captions — "a dog barking while wind blows," "someone playing piano," "water flowing and birds chirping" — into a narrow cone (0.67 mean pairwise similarity). These are all "everyday scene descriptions" and CLIP's text encoder, trained to match images, doesn't differentiate them strongly. The student achieves 0.86 cosine similarity by learning to project all audio to roughly the same point — high alignment, zero discriminative power.
+| Metric | CLIP raw | CLIP whitened |
+|--------|----------|---------------|
+| Mean pairwise cosine | 0.663 | 0.001 |
+| Rank correlation with raw | 1.000 | 0.484 |
+| Rank correlation with SBERT | 0.399 | 0.506 |
 
-SBERT spreads captions by semantic content (0.25 mean pairwise similarity, 1.6x higher spread), so "dog barking" is far from "piano playing." The student must learn genuinely different representations for different sounds, producing features that transfer to classification.
-
-**The signal-to-noise problem:** With 0.000426 per-dimension variance in CLIP embeddings, the discriminative information lives in tiny perturbations around a shared direction. The student operates in a low-SNR regime and cannot reliably extract this signal. SBERT's 2.3x higher variance gives the student a much stronger learning signal.
+Key observations:
+1. **Whitening doesn't just rescale — it changes relative geometry** (rank correlation 0.48 with raw). The discriminative structure was partially obscured by the dominant shared direction.
+2. **Whitened CLIP's geometry is closer to SBERT's** (0.51 rank correlation) than raw CLIP is (0.40). This explains why downstream performance converges.
+3. **The underlying discriminative information was always there** — whitening extracts it by removing the uninformative shared component. This is analogous to PCA-whitening in classical feature engineering.
 
 ### Implications for the Platonic Representation Hypothesis
 
-The vision experiments (Exp 7-9) showed CLIP's geometry consistently outperformed supervised geometry for vision tasks, supporting the "platonic" / universal representation hypothesis. This audio experiment provides a **counterexample**: CLIP's text geometry is worse than SBERT's for audio, despite CLIP being "multimodal."
+The vision experiments (Exp 7-9) showed CLIP's geometry consistently outperformed supervised geometry for vision tasks, supporting the "platonic" / universal representation hypothesis. The raw CLIP audio results initially appeared to be a **counterexample** — but whitening reveals a more nuanced picture:
 
-This suggests:
-- **CLIP's representations are "platonic" within vision-adjacent spaces**, not universally
-- **Semantic text representations** (SBERT) may be more universal for cross-modal transfer to non-visual modalities
-- The "universality" of a representation depends on the target modality, not just the source model's training diversity
+- **CLIP's discriminative geometry IS useful for audio** — it was just compressed into a narrow subspace by the dominant vision-centric shared direction
+- **The "platonic" structure is present but needs extraction** for out-of-distribution domains. Whitening is one simple extraction method.
+- **After whitening, CLIP ≈ SBERT for audio** — the underlying semantic content is roughly equivalent, supporting the platonic hypothesis that different models converge on similar semantic structure
+- **The practical implication**: when applying CLIP to a new domain, always check for cone collapse and whiten if needed
 
-### SBERT Exceeding AudioSet Pretraining
+### Text Distillation Exceeding AudioSet Pretraining
 
-At 1% labels, SBERT-distilled features (41%) exceed AudioSet-pretrained features (35%). This is remarkable because:
+At 1% labels, both whitened CLIP (43.6%) and SBERT (41.0%) exceed AudioSet-pretrained features (34.8% FT). This is remarkable because:
 - AudioSet pretraining uses 2M labeled audio clips vs AudioCaps' 46K audio-caption pairs
-- The SBERT teacher never processed audio
+- Neither text teacher has ever processed audio
 - This advantage disappears at higher label fractions (AudioSet catches up by 10%, dominates at 100%)
 
-The explanation: AudioSet pretraining learns audio-specific discriminative features optimized for its 527-class ontology. SBERT distillation learns semantically structured features that generalize better with minimal supervision. With 1% labels (1 sample per class), semantic structure matters more than audio-specific features.
+The explanation: AudioSet pretraining learns audio-specific discriminative features optimized for its 527-class ontology. Text distillation learns semantically structured features that generalize better with minimal supervision. With 1% labels (1 sample per class), semantic structure matters more than audio-specific features.
 
 ## Technical Notes
 
+- **Whitening procedure:** Compute per-dimension mean and std over all AudioCaps training caption embeddings (45K samples). At distillation time: `emb = (emb - mean) / (std + 1e-8)`, then L2-normalize. Stats stored in `checkpoints/clip_text_audiocaps_whitening_stats.pt`.
 - **BatchNorm calibration:** Audio mel spectrograms have statistics far from BN defaults (mean=0, var=1). We added BN running stat recalibration before each evaluation pass, computing cumulative (not EMA) statistics from training data. Without this, eval-mode predictions collapsed to a single class.
 - **AudioSet pretrained weights:** EfficientAT mn10_as weights required key remapping (adding `backbone.` prefix) and SE layer reshaping (Linear [out,in] → Conv2d [out,in,1,1]) to be compatible with torchvision's MobileNetV3.
 - **1% label fraction:** With 50 classes and only ~16 training samples, we use 1 sample per class instead of stratified split (which requires ≥1 sample per class per split).

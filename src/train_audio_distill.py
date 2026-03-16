@@ -120,6 +120,10 @@ def parse_args():
     parser.add_argument("--no_wandb", action="store_true",
                         help="Disable W&B logging")
 
+    # Whitening
+    parser.add_argument("--whiten", type=str, default=None,
+                        help="Path to whitening stats (mean/std) to apply to teacher embeddings")
+
     return parser.parse_args()
 
 
@@ -151,10 +155,11 @@ def get_lr_scheduler(optimizer, num_epochs, warmup_epochs, steps_per_epoch):
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def encode_teacher_batch(teacher, captions, teacher_name):
+def encode_teacher_batch(teacher, captions, teacher_name, whiten_stats=None):
     """Encode a batch of captions through the teacher model.
 
     Handles the different interfaces of CLIP vs Sentence-BERT.
+    Optionally whitens embeddings using precomputed mean/std.
     """
     with torch.no_grad():
         if teacher_name == "clip_text":
@@ -162,6 +167,13 @@ def encode_teacher_batch(teacher, captions, teacher_name):
             teacher_emb = teacher(tokens)
         else:  # sentence_bert
             teacher_emb = teacher.encode(captions)
+
+        if whiten_stats is not None:
+            mean = whiten_stats["mean"].to(teacher_emb.device)
+            std = whiten_stats["std"].to(teacher_emb.device)
+            teacher_emb = (teacher_emb - mean) / (std + 1e-8)
+            teacher_emb = torch.nn.functional.normalize(teacher_emb, p=2, dim=-1)
+
     return teacher_emb
 
 
@@ -181,7 +193,7 @@ def train_epoch(teacher, student, dataloader, optimizer, scheduler, scaler, args
         waveforms = waveforms.to(args.device, non_blocking=True)
 
         # Get teacher embeddings from text captions
-        teacher_emb = encode_teacher_batch(teacher, captions, teacher_name)
+        teacher_emb = encode_teacher_batch(teacher, captions, teacher_name, args.whiten_stats)
 
         optimizer.zero_grad()
 
@@ -276,7 +288,7 @@ def validate(teacher, student, val_loader, args):
 
     for waveforms, captions in tqdm(val_loader, desc="Val", leave=False):
         waveforms = waveforms.to(args.device, non_blocking=True)
-        teacher_emb = encode_teacher_batch(teacher, captions, teacher_name)
+        teacher_emb = encode_teacher_batch(teacher, captions, teacher_name, args.whiten_stats)
         student_emb = student.mel_forward(waveforms, normalize=True)
 
         loss = embedding_loss(student_emb, teacher_emb)
@@ -314,6 +326,13 @@ def save_checkpoint(student, optimizer, scheduler, epoch, args, filename):
 def main():
     args = parse_args()
     set_seed(args.seed)
+
+    # Load whitening stats if specified
+    if args.whiten:
+        args.whiten_stats = torch.load(args.whiten, map_location="cpu", weights_only=True)
+        print(f"Loaded whitening stats from {args.whiten}")
+    else:
+        args.whiten_stats = None
 
     os.makedirs(args.output_dir, exist_ok=True)
 
