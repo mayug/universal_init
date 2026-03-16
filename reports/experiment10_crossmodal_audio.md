@@ -28,7 +28,8 @@ We test whether text-based embedding geometry transfers cross-modally to audio â
 |---------|----------------------|
 | CLIP text (raw) | **0.861** |
 | CLIP text (whitened) | 0.423 |
-| Sentence-BERT | 0.724 |
+| Sentence-BERT (raw) | 0.724 |
+| Sentence-BERT (whitened) | 0.469 |
 
 Note: Higher alignment to raw CLIP did NOT translate to better downstream features. Whitened CLIP has lower alignment but much better geometry.
 
@@ -48,7 +49,8 @@ Note: Higher alignment to raw CLIP did NOT translate to better downstream featur
 | A: Random | 70.2 | 13.4 | 13.8 | 5.2 | 8.2 | 3.8 |
 | B: CLIP text (raw) | 75.0 | 4.2 | 19.5 | 3.4 | 8.1 | 9.3 |
 | D: CLIP text (whitened) | 83.9 | 75.6 | 57.9 | 56.6 | **43.6** | **43.6** |
-| E: SBERT distilled | **86.0** | 74.5 | **60.8** | **58.0** | 41.0 | 41.8 |
+| E: SBERT (raw) | **86.0** | 74.5 | **60.8** | **58.0** | 41.0 | 41.8 |
+| F: SBERT (whitened) | 82.4 | 73.2 | 54.4 | 52.9 | 32.2 | 36.2 |
 | C: AudioSet pretrained | **96.9** | **89.2** | **73.8** | 54.7 | 34.8 | 30.3 |
 
 ### Head-to-Head: Raw CLIP vs Sentence-BERT
@@ -89,6 +91,28 @@ Note: Higher alignment to raw CLIP did NOT translate to better downstream featur
 | 1% Linear Probe | 9.3 | 43.6 | +34.3pp |
 
 Average improvement: **+40.3 percentage points**. Whitening transforms CLIP from useless to competitive.
+
+### Impact of Whitening on SBERT
+
+| Setting | Raw SBERT | Whitened SBERT | Delta |
+|---------|-----------|----------------|-------|
+| 100% Fine-tune | 86.0 | 82.4 | -3.6pp |
+| 100% Linear Probe | 74.5 | 73.2 | -1.3pp |
+| 10% Fine-tune | 60.8 | 54.4 | -6.4pp |
+| 10% Linear Probe | 58.0 | 52.9 | -5.2pp |
+| 1% Fine-tune | 41.0 | 32.2 | -8.8pp |
+| 1% Linear Probe | 41.8 | 36.2 | -5.7pp |
+
+Average change: **-5.2 percentage points**. Whitening hurts SBERT across all settings.
+
+### Whitening Asymmetry
+
+| Teacher | Raw pairwise cosine | Whitening effect | Avg change |
+|---------|--------------------:|:----------------:|:----------:|
+| CLIP text | 0.663 (cone) | Fixes cone | **+40.3pp** |
+| SBERT | 0.256 (spread) | Distorts geometry | **-5.2pp** |
+
+Whitening is a targeted fix for the cone problem, not a universal improvement. SBERT's embeddings are already well-distributed; whitening disrupts their natural geometric structure. This confirms the diagnosis: CLIP's audio failure was specifically caused by the narrow embedding cone, not by a fundamental deficiency in CLIP's learned semantics.
 
 ### Gap Closure vs AudioSet Pretrained Ceiling
 
