@@ -442,18 +442,38 @@ def main():
         print(f"  Val Cosine sim: {val_cos:.4f} (gap: {gap:.4f})")
 
         # Save best model
-        if val_cos > best_val_cos_sim:
-            best_val_cos_sim = val_cos
-            ckpt_name = f"audiocaps_{args.teacher}_distilled_best.pth"
+        # For CKA-only: use CKA (structural alignment) instead of cosine similarity
+        if args.loss == "cka_only":
+            val_metric = 1.0 - metrics.get("train/cka_loss", 1.0)
+        else:
+            val_metric = val_cos
+        if val_metric > best_val_cos_sim:
+            best_val_cos_sim = val_metric
+            if args.loss == "cka_only":
+                ckpt_name = f"audiocaps_{args.teacher}_cka_only_distilled_best.pth"
+            elif args.loss == "cka_combined":
+                ckpt_name = f"audiocaps_{args.teacher}_cka_l{args.lambda_cka}_distilled_best.pth"
+            else:
+                ckpt_name = f"audiocaps_{args.teacher}_distilled_best.pth"
             save_checkpoint(student, optimizer, scheduler, epoch, args, ckpt_name)
 
         # Periodic checkpoints
         if epoch % args.save_every == 0:
-            periodic_name = f"audiocaps_{args.teacher}_distilled_epoch{epoch}.pth"
+            if args.loss == "cka_only":
+                periodic_name = f"audiocaps_{args.teacher}_cka_only_distilled_epoch{epoch}.pth"
+            elif args.loss == "cka_combined":
+                periodic_name = f"audiocaps_{args.teacher}_cka_l{args.lambda_cka}_distilled_epoch{epoch}.pth"
+            else:
+                periodic_name = f"audiocaps_{args.teacher}_distilled_epoch{epoch}.pth"
             save_checkpoint(student, optimizer, scheduler, epoch, args, periodic_name)
 
     # Save final checkpoint
-    final_name = f"audiocaps_{args.teacher}_distilled_final.pth"
+    if args.loss == "cka_only":
+        final_name = f"audiocaps_{args.teacher}_cka_only_distilled_final.pth"
+    elif args.loss == "cka_combined":
+        final_name = f"audiocaps_{args.teacher}_cka_l{args.lambda_cka}_distilled_final.pth"
+    else:
+        final_name = f"audiocaps_{args.teacher}_distilled_final.pth"
     save_checkpoint(student, optimizer, scheduler, args.epochs, args, final_name)
 
     print("\n" + "=" * 60)
