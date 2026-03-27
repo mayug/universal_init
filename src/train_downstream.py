@@ -26,7 +26,8 @@ def parse_args():
 
     # Data
     parser.add_argument("--dataset", type=str, required=True,
-                        choices=["pets", "flowers102", "dtd", "eurosat", "imagenette", "voc"],
+                        choices=["pets", "flowers102", "dtd", "eurosat", "imagenette", "voc",
+                                 "pathmnist", "dermamnist", "bloodmnist"],
                         help="Downstream dataset")
     parser.add_argument("--data_root", type=str, default="./data",
                         help="Root directory for datasets")

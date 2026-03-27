@@ -16,6 +16,7 @@ from torchvision.datasets import (
 )
 from sklearn.model_selection import train_test_split
 import numpy as np
+from PIL import Image
 
 
 def get_train_transform():
@@ -80,6 +81,53 @@ class VOCMultiLabel(torch.utils.data.Dataset):
         return img, label
 
 
+class MedMNISTDataset(torch.utils.data.Dataset):
+    """Wrapper for MedMNIST datasets loaded from .npz files.
+
+    Loads pre-downloaded 224x224 npz files (e.g., pathmnist_224.npz).
+    Returns PIL images and integer labels.
+    """
+
+    MEDMNIST_INFO = {
+        "pathmnist": {"num_classes": 9, "filename": "pathmnist_224.npz"},
+        "dermamnist": {"num_classes": 7, "filename": "dermamnist_224.npz"},
+        "bloodmnist": {"num_classes": 8, "filename": "bloodmnist_224.npz"},
+    }
+
+    def __init__(self, root, dataset_name, split="train", transform=None):
+        assert dataset_name in self.MEDMNIST_INFO, f"Unknown MedMNIST dataset: {dataset_name}"
+        assert split in ("train", "val", "test"), f"Unknown split: {split}"
+
+        info = self.MEDMNIST_INFO[dataset_name]
+        npz_path = os.path.join(root, info["filename"])
+        if not os.path.exists(npz_path):
+            raise FileNotFoundError(
+                f"MedMNIST file not found: {npz_path}. "
+                f"Download with: python -c \"import medmnist; "
+                f"medmnist.{dataset_name.upper().replace('MNIST','')}MNIST(root='{root}', download=True, size=224)\""
+            )
+
+        data = np.load(npz_path)
+        self.images = data[f"{split}_images"]  # (N, 224, 224, 3) uint8
+        self.labels = data[f"{split}_labels"].squeeze().astype(np.int64)  # (N,)
+        self.transform = transform
+
+    @property
+    def targets(self):
+        """For compatibility with stratified sampling."""
+        return self.labels.tolist()
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        img = Image.fromarray(self.images[index])
+        label = int(self.labels[index])
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
 # Dataset configurations
 DATASET_INFO = {
     "pets": {
@@ -123,6 +171,27 @@ DATASET_INFO = {
         "train_split": "trainval",
         "test_split": "test",
         "multilabel": True,
+    },
+    "pathmnist": {
+        "class": None,
+        "num_classes": 9,
+        "train_split": "train",
+        "test_split": "test",
+        "multilabel": False,
+    },
+    "dermamnist": {
+        "class": None,
+        "num_classes": 7,
+        "train_split": "train",
+        "test_split": "test",
+        "multilabel": False,
+    },
+    "bloodmnist": {
+        "class": None,
+        "num_classes": 8,
+        "train_split": "train",
+        "test_split": "test",
+        "multilabel": False,
     },
 }
 
@@ -256,6 +325,12 @@ def load_dataset(
         return VOCMultiLabel(
             root=data_root, image_set=image_set,
             download=True, transform=transform,
+        )
+
+    elif dataset_name in MedMNISTDataset.MEDMNIST_INFO:
+        return MedMNISTDataset(
+            root=data_root, dataset_name=dataset_name,
+            split=split, transform=transform,
         )
 
     else:
